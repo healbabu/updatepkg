@@ -1,0 +1,117 @@
+{
+  "name": "dotnet-package-upgrader",
+  "displayName": ".NET Package Upgrader",
+  "description": "VS Code extension for automated .NET package upgrades using corporate package recommendation service and Copilot agent",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:csharp",
+    "onCommand:dotnet-package-upgrader.upgradePackages",
+    "onLanguageModelTool:dotnet-package-upgrader"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "dotnet-package-upgrader.upgradePackages",
+        "title": "Upgrade .NET Packages"
+      }
+    ],
+    "configuration": {
+      "title": ".NET Package Upgrader",
+      "properties": {
+        "dotnetPackageUpgrader.autoUpgrade": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable automatic package upgrades"
+        },
+        "dotnetPackageUpgrader.upgradeStrategy": {
+          "type": "string",
+          "enum": [
+            "latest",
+            "major",
+            "minor",
+            "patch"
+          ],
+          "default": "patch",
+          "description": "Package upgrade strategy"
+        },
+        "dotnetPackageUpgrader.serviceUrl": {
+          "type": "string",
+          "default": "https://api.corporate-package-service.com",
+          "description": "URL of the corporate package recommendation service"
+        },
+        "dotnetPackageUpgrader.serviceTimeout": {
+          "type": "number",
+          "default": 30000,
+          "description": "Timeout in milliseconds for service requests"
+        },
+        "dotnetPackageUpgrader.useCorporateService": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether to use the corporate package recommendation service"
+        },
+        "dotnetPackageUpgrader.copilotAgent": {
+          "type": "object",
+          "default": {
+            "enabled": true,
+            "contextAware": true,
+            "securityAnalysis": true,
+            "testAnalysis": true
+          },
+          "description": "Copilot agent configuration"
+        },
+        "dotnetPackageUpgrader.customRules": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Custom rules for package upgrades"
+        },
+        "dotnetPackageUpgrader.securityRequirements": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Security requirements for package upgrades"
+        }
+      }
+    },
+    "chatParticipants": [
+      {
+        "id": "dotnet-package-upgrader",
+        "name": "DotNet Package Upgrader",
+        "description": "Helps upgrade .NET packages with intelligent conflict resolution",
+        "isSticky": true
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.57",
+    "@types/vscode": "^1.100.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.1",
+    "@typescript-eslint/parser": "^6.13.1",
+    "eslint": "^8.54.0",
+    "typescript": "^5.3.2"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "dotnet-package-upgrader": "file:",
+    "winston": "^3.11.0"
+  }
+}
