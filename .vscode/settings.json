@@ -1,0 +1,17 @@
+{
+    "typescript.preferences.includePackageJsonAutoImports": "on",
+    "typescript.tsc.autoDetect": "on",
+    "typescript.suggest.autoImports": true,
+    "eslint.validate": [
+        "typescript"
+    ],
+    "files.exclude": {
+        "out": false,
+        "node_modules": true
+    },
+    "search.exclude": {
+        "out": true,
+        "node_modules": true
+    },
+    "typescript.compile.autoDetect": "on"
+} 
