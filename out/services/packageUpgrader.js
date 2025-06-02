@@ -421,13 +421,12 @@ class PackageUpgrader {
     async updatePackageWithDetails(packageName, version, projectPath) {
         try {
             this.logger.info('Updating package with detailed monitoring', { package: packageName, version, projectPath });
-            // Update package using dotnet CLI with more detailed output
             await new Promise((resolve, reject) => {
                 const { exec } = require('child_process');
                 const command = `dotnet add "${projectPath}" package ${packageName} --version ${version}`;
-                exec(command, { cwd: path.dirname(projectPath) }, (error, stdout, stderr) => {
+                exec(command, { cwd: path.dirname(projectPath) }, async (error, stdout, stderr) => {
                     if (error) {
-                        this.logger.error('Package update failed with detailed info', {
+                        this.logger.error('Package update failed', {
                             package: packageName,
                             version,
                             projectPath,
@@ -436,27 +435,489 @@ class PackageUpgrader {
                             stderr,
                             error: error.message
                         });
-                        // Create enhanced error with more context
-                        const enhancedError = new Error(`${error.message}\nCommand: ${command}\nStdout: ${stdout}\nStderr: ${stderr}`);
-                        reject(enhancedError);
+                        // Parse error with basic classification
+                        const basicError = this.parseUpdateError(stderr, stdout, error.message);
+                        // ✅ ENHANCED: Get AI analysis for ANY package update error
+                        const enhancedError = await this.enhanceErrorWithAI(basicError, {
+                            command,
+                            projectPath,
+                            packageName,
+                            version
+                        });
+                        const enhancedErrorObj = new Error(enhancedError.userFriendlyMessage);
+                        enhancedErrorObj.details = enhancedError;
+                        enhancedErrorObj.rawOutput = { stdout, stderr, command };
+                        reject(enhancedErrorObj);
                     }
                     else {
-                        this.logger.info('Package updated successfully with details', {
-                            package: packageName,
-                            version,
-                            stdout: stdout.trim(),
-                            stderr: stderr.trim()
-                        });
+                        this.logger.info('Package updated successfully', { package: packageName, version });
                         resolve();
                     }
                 });
             });
-            this.logger.info('Package updated successfully', { package: packageName, version });
         }
         catch (error) {
             this.logger.error('Failed to update package', { package: packageName, version, error });
             throw error;
         }
+    }
+    /**
+     * Parse dotnet CLI error output to extract structured error information
+     * @param stderr Standard error output
+     * @param stdout Standard output
+     * @param originalError Original error message
+     * @returns Structured error information
+     */
+    async parseUpdateError(stderr, stdout, originalError) {
+        const combined = `${stderr}\n${stdout}`;
+        // Parse NU1107 Version Conflict with enhanced extraction
+        if (combined.includes('NU1107')) {
+            const conflictMatch = combined.match(/Version conflict detected for (.+?)\. Install\/reference (.+?) directly to project (.+?) to resolve/);
+            // Extract all dependency chain lines
+            const dependencyChains = [];
+            const lines = combined.split('\n');
+            for (const line of lines) {
+                if (line.includes('->') && (line.includes('>=') || line.includes('<'))) {
+                    dependencyChains.push(line.trim());
+                }
+            }
+            const conflictingPackage = conflictMatch ? conflictMatch[1] : 'Unknown package';
+            const recommendedVersion = conflictMatch ? conflictMatch[2] : '';
+            const affectedProject = conflictMatch ? conflictMatch[3] : '';
+            const conflictDetails = {
+                conflictingPackage,
+                requiredVersions: [recommendedVersion],
+                dependencyChains: dependencyChains.length > 0 ? dependencyChains : [
+                    `Multiple dependency paths require different versions of ${conflictingPackage}`
+                ]
+            };
+            // Start with basic recommendations (will be replaced by AI if available)
+            let recommendations = [
+                `Add explicit reference: dotnet add "${affectedProject}" package ${conflictingPackage} --version ${recommendedVersion}`,
+                'Update related packages to compatible versions',
+                'Review project references and consolidate package versions'
+            ];
+            return {
+                type: 'version_conflict',
+                userFriendlyMessage: `Version conflict detected for ${conflictingPackage}`,
+                technicalDetails: combined,
+                conflictDetails,
+                recommendations
+            };
+        }
+        // Parse NU1102 Package Not Found
+        if (combined.includes('NU1102')) {
+            return {
+                type: 'not_found',
+                userFriendlyMessage: 'Package not found or network connectivity issue',
+                technicalDetails: combined,
+                recommendations: [
+                    'Check internet connection',
+                    'Verify package name and version',
+                    'Check NuGet package sources configuration',
+                    'Try: dotnet nuget list source'
+                ]
+            };
+        }
+        // Parse NU1605 Downgrade Error
+        if (combined.includes('NU1605')) {
+            return {
+                type: 'downgrade',
+                userFriendlyMessage: 'Package downgrade detected - higher version already installed',
+                technicalDetails: combined,
+                recommendations: [
+                    'Remove existing package first: dotnet remove package <PackageName>',
+                    'Then install desired version: dotnet add package <PackageName> --version <Version>',
+                    'Check if newer version is required by other dependencies'
+                ]
+            };
+        }
+        // Parse Restore Failures
+        if (combined.includes('restore') && combined.includes('failed')) {
+            return {
+                type: 'restore_failed',
+                userFriendlyMessage: 'Package restore failed',
+                technicalDetails: combined,
+                recommendations: [
+                    'Run: dotnet restore --verbosity diagnostic',
+                    'Clear NuGet cache: dotnet nuget locals all --clear',
+                    'Check package sources and authentication',
+                    'Verify project file syntax'
+                ]
+            };
+        }
+        // Default case
+        return {
+            type: 'unknown',
+            userFriendlyMessage: originalError,
+            technicalDetails: combined,
+            recommendations: [
+                'Check the detailed error output above',
+                'Run: dotnet restore --verbosity diagnostic',
+                'Verify project file and package sources'
+            ]
+        };
+    }
+    // ============================================================================
+    // 🚀 NEW ENHANCEMENT METHODS
+    // ============================================================================
+    /**
+     * ✅ ENHANCED: Generic error enhancement for ANY error
+     */
+    async enhanceErrorWithAI(basicError, commandContext) {
+        this.logger.info('🤖 Requesting AI analysis for dotnet error', {
+            errorType: basicError.type,
+            command: commandContext.command
+        });
+        try {
+            const aiAnalysis = await this.copilotService.analyzeAnyDotnetError(basicError.technicalDetails, commandContext);
+            // ✅ Enhanced error structure with AI insights
+            return {
+                ...basicError,
+                aiAnalysis: {
+                    errorType: aiAnalysis.errorType,
+                    severity: aiAnalysis.severity,
+                    summary: aiAnalysis.summary,
+                    rootCause: aiAnalysis.rootCause,
+                    quickFix: aiAnalysis.quickFix
+                },
+                recommendations: aiAnalysis.recommendations, // Replace with AI recommendations
+                aiEnhanced: true
+            };
+        }
+        catch (aiError) {
+            this.logger.warn('AI analysis failed, using basic error', aiError);
+            return basicError;
+        }
+    }
+    /**
+     * ✅ ENHANCED: Update validation to use generic AI analysis
+     */
+    async validateSolutionAfterUpdates(solutionPath) {
+        try {
+            this.logger.info('🔍 Validating solution after updates', { solutionPath });
+            const result = await this.executeCommandWithOutput('dotnet restore', path.dirname(solutionPath));
+            if (result.success) {
+                this.logger.info('✅ Solution validation successful');
+            }
+            else {
+                this.logger.warn('❌ Solution validation failed', { stderr: result.stderr, stdout: result.stdout });
+                // Parse error with basic classification
+                const basicError = this.parseUpdateError(result.stderr, result.stdout, 'Solution validation failed');
+                // ✅ ENHANCED: Get AI analysis for ANY error type
+                const enhancedError = await this.enhanceErrorWithAI(basicError, {
+                    command: 'dotnet restore',
+                    solutionPath: solutionPath
+                });
+                const error = new Error('Solution validation failed');
+                error.details = enhancedError;
+                throw error;
+            }
+        }
+        catch (error) {
+            this.logger.error('Solution validation error', error);
+            throw error;
+        }
+    }
+    /**
+     * ✅ ENHANCEMENT 2: Enhanced version conflict analysis including transitive dependencies
+     * @param updatesMap Map of project paths to their package updates
+     * @returns Map of package names to their conflict analysis
+     */
+    async checkForTransitiveDependencyConflicts(updatesMap) {
+        const conflicts = new Map();
+        this.logger.info('🤖 AI Agent analyzing transitive dependency conflicts', {
+            projectCount: updatesMap.size,
+            totalUpdates: Array.from(updatesMap.values()).reduce((sum, updates) => sum + updates.length, 0)
+        });
+        // For each project being updated
+        for (const [projectPath, updates] of updatesMap) {
+            this.logger.info('🔍 Analyzing transitive dependencies for project', { projectPath, updateCount: updates.length });
+            for (const update of updates) {
+                try {
+                    // Get transitive dependencies for this package
+                    const transitiveDeps = await this.getTransitiveDependencies(update.packageName, update.recommendedVersion, projectPath);
+                    // Get existing packages in this project
+                    const existingDeps = await this.getPackageReferences(projectPath);
+                    // Check for conflicts with existing packages
+                    for (const [depName, depVersion] of transitiveDeps) {
+                        const existing = existingDeps.find(d => d.name === depName);
+                        if (existing && this.hasVersionConflict(existing.version, depVersion)) {
+                            this.logger.info('🤖 AI Agent detected transitive dependency conflict', {
+                                package: depName,
+                                existingVersion: existing.version,
+                                transitiveDependencyVersion: depVersion,
+                                sourceUpdate: update.packageName
+                            });
+                            // Use AI to analyze this conflict
+                            const analysis = await this.versionConflictAnalyzer.analyzeVersionConflict(depName, [
+                                { path: projectPath, version: existing.version, dependencies: new Map() },
+                                { path: `${update.packageName} (transitive)`, version: depVersion, dependencies: new Map() }
+                            ]);
+                            conflicts.set(depName, analysis);
+                            this.logger.info('🤖 AI Agent conflict analysis completed', {
+                                package: depName,
+                                recommendedVersion: analysis.recommendedVersion,
+                                reasoning: analysis.reasoning
+                            });
+                        }
+                    }
+                }
+                catch (error) {
+                    this.logger.warn('Failed to analyze transitive dependencies for package', {
+                        package: update.packageName,
+                        projectPath,
+                        error: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }
+        }
+        this.logger.info('🤖 AI Agent transitive dependency analysis completed', {
+            conflictsFound: conflicts.size,
+            conflictingPackages: Array.from(conflicts.keys())
+        });
+        return conflicts;
+    }
+    /**
+     * ✅ ENHANCEMENT 3: Get transitive dependencies for a package using dotnet CLI
+     * @param packageName Name of the package
+     * @param version Version of the package
+     * @param projectPath Path to the project (for context)
+     * @returns Map of dependency names to their versions
+     */
+    async getTransitiveDependencies(packageName, version, projectPath) {
+        try {
+            this.logger.info('🔍 Getting transitive dependencies', { package: packageName, version, projectPath });
+            // Create a temporary project to analyze dependencies
+            const tempDir = path.join(path.dirname(projectPath), '.temp-dependency-analysis');
+            const tempProject = path.join(tempDir, 'temp.csproj');
+            // Ensure temp directory exists
+            if (!fs.existsSync(tempDir)) {
+                fs.mkdirSync(tempDir, { recursive: true });
+            }
+            // Create minimal project file
+            const projectContent = `<Project Sdk="Microsoft.NET.Sdk">
+                <PropertyGroup>
+                    <TargetFramework>net8.0</TargetFramework>
+                </PropertyGroup>
+                <ItemGroup>
+                    <PackageReference Include="${packageName}" Version="${version}" />
+                </ItemGroup>
+            </Project>`;
+            fs.writeFileSync(tempProject, projectContent);
+            // Run dotnet list package --include-transitive
+            const result = await this.executeCommandWithOutput('dotnet list package --include-transitive', tempDir);
+            const dependencies = new Map();
+            if (result.success) {
+                const lines = result.stdout.split('\n');
+                let inTransitiveSection = false;
+                for (const line of lines) {
+                    if (line.includes('Transitive packages')) {
+                        inTransitiveSection = true;
+                        continue;
+                    }
+                    if (inTransitiveSection && line.trim().startsWith('>')) {
+                        const parts = line.trim().split(/\s+/);
+                        if (parts.length >= 3) {
+                            const depName = parts[1];
+                            const depVersion = parts[2];
+                            dependencies.set(depName, depVersion);
+                        }
+                    }
+                }
+            }
+            // Cleanup temp directory
+            try {
+                fs.rmSync(tempDir, { recursive: true, force: true });
+            }
+            catch (cleanupError) {
+                this.logger.warn('Failed to cleanup temp directory', { tempDir, error: cleanupError });
+            }
+            this.logger.info('🔍 Transitive dependencies retrieved', {
+                package: packageName,
+                dependencyCount: dependencies.size,
+                dependencies: Array.from(dependencies.entries()).slice(0, 5) // Log first 5 for brevity
+            });
+            return dependencies;
+        }
+        catch (error) {
+            this.logger.error('Failed to get transitive dependencies', { package: packageName, error });
+            return new Map();
+        }
+    }
+    /**
+     * Check if two versions have a conflict (simplified semantic version comparison)
+     * @param existingVersion Current version
+     * @param newVersion New version being introduced
+     * @returns True if there's a potential conflict
+     */
+    hasVersionConflict(existingVersion, newVersion) {
+        try {
+            // Simple major version conflict detection
+            const existingMajor = parseInt(existingVersion.split('.')[0]);
+            const newMajor = parseInt(newVersion.split('.')[0]);
+            // Major version differences are likely to cause conflicts
+            const hasMajorConflict = existingMajor !== newMajor;
+            if (hasMajorConflict) {
+                this.logger.info('Potential version conflict detected', {
+                    existing: existingVersion,
+                    new: newVersion,
+                    existingMajor,
+                    newMajor
+                });
+            }
+            return hasMajorConflict;
+        }
+        catch (error) {
+            this.logger.warn('Failed to parse versions for conflict detection', {
+                existingVersion,
+                newVersion,
+                error
+            });
+            return false;
+        }
+    }
+    /**
+     * Execute a command and return detailed output
+     * @param command Command to execute
+     * @param workingDirectory Working directory
+     * @returns Promise with success status and output
+     */
+    async executeCommandWithOutput(command, workingDirectory) {
+        return new Promise((resolve) => {
+            (0, child_process_1.exec)(command, { cwd: workingDirectory }, (error, stdout, stderr) => {
+                resolve({
+                    success: !error,
+                    stdout: stdout || '',
+                    stderr: stderr || ''
+                });
+            });
+        });
+    }
+    /**
+     * 🤖 AI-powered conflict detection - completely generic
+     */
+    async detectAdvancedConflicts(updatesMap) {
+        this.logger.info('🤖 AI Agent analyzing advanced version conflicts...');
+        const conflicts = new Map();
+        try {
+            const dependencyState = await this.buildSimpleDependencyState(updatesMap);
+            const aiAnalysis = await this.copilotService.analyzeAdvancedConflicts(dependencyState, Array.from(updatesMap.values()).flat());
+            // ✅ FIX: Use only valid VersionConflictAnalysis properties
+            for (const analysis of aiAnalysis) {
+                if (analysis.package) {
+                    conflicts.set(analysis.package, {
+                        packageName: analysis.package,
+                        currentVersions: ['unknown'],
+                        recommendedVersion: 'latest',
+                        reasoning: analysis.conflict || 'Version conflict detected',
+                        migrationSteps: ['Update package reference'],
+                        breakingChanges: [],
+                        compatibilityNotes: [],
+                        testImpact: []
+                    });
+                }
+            }
+        }
+        catch (error) {
+            this.logger.error('Advanced conflict analysis failed', error);
+        }
+        return conflicts;
+    }
+    /**
+     * 📊 Build comprehensive dependency state for AI analysis
+     */
+    async buildSimpleDependencyState(updatesMap) {
+        const context = {
+            projects: [],
+            proposedUpdates: Array.from(updatesMap.values()).flat()
+        };
+        for (const [projectPath, updates] of updatesMap) {
+            try {
+                const directPackages = await this.getDirectPackageReferences(projectPath);
+                context.projects.push({
+                    path: projectPath,
+                    directPackages: Array.from(directPackages.entries()),
+                    proposedUpdates: updates
+                });
+            }
+            catch (error) {
+                this.logger.warn('Failed to analyze project dependencies', { projectPath, error });
+            }
+        }
+        return context;
+    }
+    /**
+     * 📦 Get current packages in project (generic implementation)
+     */
+    async getCurrentPackages(projectPath) {
+        return new Promise((resolve) => {
+            const packages = new Map();
+            (0, child_process_1.exec)(`dotnet list "${projectPath}" package`, (error, stdout) => {
+                if (error) {
+                    this.logger.warn('Failed to get current packages', { projectPath, error });
+                    resolve(packages);
+                    return;
+                }
+                const lines = stdout.split('\n');
+                for (const line of lines) {
+                    if (line.trim().startsWith('>')) {
+                        const parts = line.trim().split(/\s+/);
+                        if (parts.length >= 3) {
+                            packages.set(parts[1], parts[2]);
+                        }
+                    }
+                }
+                resolve(packages);
+            });
+        });
+    }
+    /**
+     * 🔗 Get direct package references (generic)
+     */
+    async getDirectPackageReferences(projectPath) {
+        const packages = new Map();
+        try {
+            const fs = require('fs');
+            const content = fs.readFileSync(projectPath, 'utf-8');
+            const packageRefRegex = /<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)"/g;
+            let match;
+            while ((match = packageRefRegex.exec(content)) !== null) {
+                packages.set(match[1], match[2]);
+            }
+        }
+        catch (error) {
+            this.logger.warn('Failed to read package references', { projectPath, error });
+        }
+        return packages;
+    }
+    // ✅ SIMPLE VERSION: Basic validation without complex types
+    async validateUpdatePlan(strategy) {
+        this.logger.info('Validating update plan', { phases: strategy.phases?.length || 0 });
+        const issues = [];
+        try {
+            // Simple validation - check if packages exist
+            for (const phase of strategy.phases || []) {
+                for (const update of phase.packageUpdates || []) {
+                    // Basic package name validation
+                    if (!update.packageName || update.packageName.trim() === '') {
+                        issues.push({
+                            severity: 'critical',
+                            message: 'Invalid package name found'
+                        });
+                    }
+                }
+            }
+        }
+        catch (error) {
+            this.logger.warn('Validation failed', error);
+        }
+        return {
+            canProceed: issues.filter(i => i.severity === 'critical').length === 0,
+            warnings: issues.filter(i => i.severity === 'warning'),
+            blockers: issues.filter(i => i.severity === 'critical'),
+            recommendations: ['Run dotnet restore after updates', 'Test your solution thoroughly']
+        };
     }
 }
 exports.PackageUpgrader = PackageUpgrader;

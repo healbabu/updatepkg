@@ -83,6 +83,20 @@ class Logger {
         }
     }
     /**
+     * Log a debug message (only when in development/verbose mode)
+     * @param message The message to log
+     * @param meta Additional metadata
+     */
+    debug(message, meta) {
+        // Only log debug in development or when explicitly enabled
+        const config = vscode.workspace.getConfiguration('dotnetPackageUpgrader');
+        const verboseLogging = config.get('verboseLogging', false);
+        if (verboseLogging) {
+            this.logger.debug(message, meta);
+            this.outputChannel.appendLine(`[DEBUG] ${message}`);
+        }
+    }
+    /**
      * Show the output channel
      */
     showOutput() {
