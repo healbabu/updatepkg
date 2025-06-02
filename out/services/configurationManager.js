@@ -107,7 +107,7 @@ class ConfigurationManager {
      * Get whether AI analysis is enabled
      */
     get aiAnalysisEnabled() {
-        return this.config.get('aiAnalysisEnabled', false); // Default to false until Copilot is working
+        return this.config.get('aiAnalysisEnabled', true); // Default to false until Copilot is working
     }
     /**
      * Update the configuration
