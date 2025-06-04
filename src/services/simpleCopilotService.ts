@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { Logger } from '../utils/logger';
 
 /**
- * Simplified Copilot Service - Focus on outdated package strategies
+ * Simplified Copilot Service - only what's needed for simple package upgrader
  */
 export class CopilotService {
     private logger: Logger;
@@ -12,7 +12,7 @@ export class CopilotService {
     }
 
     /**
-     * Generate AI upgrade strategy for outdated packages
+     * Generate AI upgrade strategy for simple package updates
      */
     async generateUpgradeStrategy(
         updateSummary: any,
@@ -84,34 +84,34 @@ export class CopilotService {
     private buildUpgradeStrategyPrompt(updateSummary: any, dependencyInfo?: any): string {
         const updates = updateSummary.updates || [];
         
-        return `You are a .NET package upgrade expert. Create an intelligent upgrade strategy for these outdated packages.
+        return `You are a .NET package upgrade expert. Analyze these available package updates and provide an upgrade strategy.
 
-OUTDATED PACKAGES:
-${updates.map((u: any) => `- ${u.packageName}: ${u.currentVersion} → ${u.recommendedVersion} (${u.projectPath})`).join('\n')}
+Available Package Updates:
+${updates.map((u: any) => `- ${u.packageName}: ${u.currentVersion} → ${u.recommendedVersion} (Project: ${u.projectPath})`).join('\n')}
 
-UPGRADE PRINCIPLES:
-1. 📦 Microsoft.* framework packages = Upgrade FIRST (highest priority)
-2. 🔗 Related package families = Group together (e.g., all Entity Framework packages)
-3. 📈 Dependencies = Upgrade before dependents  
-4. 🧪 Breaking changes = Minimize impact where possible
-5. 📊 Version jumps = Prefer incremental updates over major version leaps
-
-Please respond with ONLY a JSON object in this exact format:
+Please provide a JSON response with this structure:
 {
-  "name": "Upgrade Strategy Name",
+  "name": "Strategy Name",
   "description": "Brief strategy description",
   "packages": [
     {
-      "packageName": "ExactPackageName",
-      "currentVersion": "CurrentVersion",
-      "recommendedVersion": "TargetVersion",
-      "projectPath": "ProjectPath"
+      "packageName": "PackageName",
+      "currentVersion": "1.0.0", 
+      "recommendedVersion": "2.0.0",
+      "projectPath": "Project.csproj"
     }
   ],
-  "aiReasoning": "Detailed explanation of the upgrade order and reasoning"
+  "aiReasoning": "Explanation of the upgrade order and reasoning"
 }
 
-CRITICAL: Return ONLY the JSON object, no markdown formatting or additional text.`;
+Consider:
+1. Upgrade framework packages first (Microsoft.*)
+2. Group related packages together
+3. Upgrade dependencies before dependents
+4. Avoid breaking changes where possible
+5. Prioritize security updates
+
+Respond with ONLY the JSON object, no additional text.`;
     }
 
     /**
@@ -120,17 +120,17 @@ CRITICAL: Return ONLY the JSON object, no markdown formatting or additional text
     private generateFallbackUpgradeStrategy(updateSummary: any): string {
         const updates = updateSummary.updates || [];
         
-        // Simple strategy: Microsoft packages first, then others alphabetically
+        // Simple strategy: prioritize Microsoft packages first, then others
         const microsoftPackages = updates.filter((u: any) => u.packageName.startsWith('Microsoft.'));
         const otherPackages = updates.filter((u: any) => !u.packageName.startsWith('Microsoft.'));
         
         const orderedPackages = [...microsoftPackages, ...otherPackages];
 
         return JSON.stringify({
-            name: "Microsoft-First Sequential Strategy",
-            description: `Upgrade ${microsoftPackages.length} Microsoft packages first, then ${otherPackages.length} other packages`,
+            name: "Sequential Upgrade Strategy",
+            description: "Upgrade packages sequentially, starting with Microsoft packages",
             packages: orderedPackages,
-            aiReasoning: "AI unavailable - using fallback strategy that prioritizes Microsoft framework packages first to ensure compatibility, followed by other packages alphabetically"
+            aiReasoning: "AI unavailable - using fallback strategy that prioritizes Microsoft packages first, then others alphabetically"
         }, null, 2);
     }
 

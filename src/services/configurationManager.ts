@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
 import { Logger } from '../utils/logger';
-import { PackageUpgrader } from '../services/packageUpgrader';
 
 /**
  * Interface for Copilot agent configuration
@@ -46,24 +45,24 @@ export class ConfigurationManager {
     }
 
     /**
-     * Get the corporate service URL
+     * Get whether AI analysis is enabled
      */
-    get serviceUrl(): string {
-        return this.config.get('serviceUrl') || 'https://api.corporate-package-service.com';
+    get enableAI(): boolean {
+        return this.config.get('enableAI', true);
     }
 
     /**
-     * Get the service timeout in milliseconds
+     * Get upgrade timeout in milliseconds
      */
-    get serviceTimeout(): number {
-        return this.config.get('serviceTimeout') || 30000;
+    get upgradeTimeout(): number {
+        return this.config.get('upgradeTimeout', 60000);
     }
 
     /**
-     * Get whether to use corporate service recommendations
+     * Get restore timeout in milliseconds
      */
-    get useCorporateService(): boolean {
-        return this.config.get('useCorporateService') || true;
+    get restoreTimeout(): number {
+        return this.config.get('restoreTimeout', 120000);
     }
 
     /**
@@ -79,24 +78,12 @@ export class ConfigurationManager {
     }
 
     /**
-     * Get custom rules for package upgrades
+     * Get a configuration value
+     * @param key The configuration key
+     * @param defaultValue The default value if not set
      */
-    get customRules(): string[] {
-        return this.config.get('customRules') || [];
-    }
-
-    /**
-     * Get security requirements for package upgrades
-     */
-    get securityRequirements(): string[] {
-        return this.config.get('securityRequirements') || [];
-    }
-
-    /**
-     * Get whether AI analysis is enabled
-     */
-    get aiAnalysisEnabled(): boolean {
-        return this.config.get('aiAnalysisEnabled', true); // Default to false until Copilot is working
+    getConfig<T>(key: string, defaultValue: T): T {
+        return this.config.get(key, defaultValue);
     }
 
     /**
@@ -110,40 +97,6 @@ export class ConfigurationManager {
             this.logger.info(`Updated configuration: ${key} = ${value}`);
         } catch (error) {
             this.logger.error('Failed to update configuration', { key, value, error });
-            throw error;
-        }
-    }
-
-    /**
-     * Get a configuration value
-     * @param key The configuration key
-     * @param defaultValue The default value if not set
-     */
-    getConfig<T>(key: string, defaultValue: T): T {
-        return this.config.get(key, defaultValue);
-    }
-
-    /**
-     * Reset configuration to defaults
-     */
-    async resetConfig(): Promise<void> {
-        try {
-            await this.config.update('autoUpgrade', false);
-            await this.config.update('upgradeStrategy', 'patch');
-            await this.config.update('serviceUrl', 'https://api.corporate-package-service.com');
-            await this.config.update('serviceTimeout', 30000);
-            await this.config.update('useCorporateService', true);
-            await this.config.update('copilotAgent', {
-                enabled: true,
-                contextAware: true,
-                securityAnalysis: true,
-                testAnalysis: true
-            });
-            await this.config.update('customRules', []);
-            await this.config.update('securityRequirements', []);
-            this.logger.info('Reset configuration to defaults');
-        } catch (error) {
-            this.logger.error('Failed to reset configuration', error);
             throw error;
         }
     }
