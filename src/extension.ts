@@ -1,899 +1,133 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
 import { Logger } from './utils/logger';
-import { PackageUpgrader, PackageUpdate } from './services/packageUpgrader';
-import { PackageRecommenderService } from './services/packageRecommenderService';
+import { PackageUpgrader } from './services/packageUpgrader';
 import { ConfigurationManager } from './services/configurationManager';
-import { BreakingChangeHandler } from './services/breakingChangeHandler';
-import { CopilotService } from './services/copilotService';
-import { DependencyGraphAnalyzer } from './services/dependencyGraphAnalyzer';
-import { UpgradeStrategist, UpgradeStrategy } from './services/upgradeStrategist';
 
 /**
  * Extension activation event handler
- * @param context The extension context
  */
 export async function activate(context: vscode.ExtensionContext) {
     const logger = new Logger();
     const configManager = new ConfigurationManager();
-    const copilotService = new CopilotService(logger);
     
-    // Get the corporate service URL from configuration
-    const serviceUrl = configManager.getConfig('serviceUrl', 'https://api.corporate-package-service.com');
-    const serviceTimeout = configManager.getConfig('serviceTimeout', 30000);
-    
-    const recommenderService = new PackageRecommenderService(logger, serviceUrl, serviceTimeout);
-    const packageUpgrader = new PackageUpgrader(logger);
-    const breakingChangeHandler = new BreakingChangeHandler(logger);
+    logger.info('🚀 .NET Package Upgrader extension activated');
 
-    logger.info('Extension activated');
-
-    // 🔍 Diagnose Copilot availability on startup
-    copilotService.diagnoseCopilotAvailability().then(diagnosis => {
-        if (diagnosis.availableModels.length > 0) {
-            logger.info('🤖 Copilot AI ready', { 
-                modelCount: diagnosis.availableModels.length,
-                models: diagnosis.availableModels.map(m => m.id)
-            });
-        } else {
-            logger.warn('⚠️ Copilot AI not available', { 
-                recommendations: diagnosis.recommendations 
-            });
-        }
-    }).catch(error => {
-        logger.error('Copilot diagnosis failed', error);
-    });
-
-    // Register the upgrade packages command
-    const disposable = vscode.commands.registerCommand('dotnet-package-upgrader.upgradePackages', async () => {
+    // Register the main upgrade command
+    const upgradeDisposable = vscode.commands.registerCommand('dotnet-package-upgrader.upgradePackages', async () => {
         try {
             const workspaceFolders = vscode.workspace.workspaceFolders;
             if (!workspaceFolders) {
-                throw new Error('No workspace folder found');
+                vscode.window.showErrorMessage('No workspace folder found. Please open a .NET solution.');
+                return;
             }
 
-            const progressOptions: vscode.ProgressOptions = {
-                location: vscode.ProgressLocation.Notification,
-                title: 'Upgrading .NET Solution Packages',
-                cancellable: true
-            };
+            // Find solution file first
+            const solutionPath = await findSolutionOrProjectFile();
+            if (!solutionPath) {
+                vscode.window.showErrorMessage('No .sln or .csproj file found in workspace');
+                return;
+            }
 
-            await vscode.window.withProgress(progressOptions, async (progress, token) => {
-                token.onCancellationRequested(() => {
-                    logger.info('Package upgrade cancelled by user');
-                });
+            // Show the upgrade options webview immediately
+            await showUpgradeOptionsWebview(solutionPath, logger);
 
-                const solutionPath = await findSolutionFile();
-                if (!solutionPath) return;
-                await handleSolutionUpdate(solutionPath, progress);
-            });
         } catch (error) {
-            logger.error('Error during package upgrade', error);
-            vscode.window.showErrorMessage('Failed to upgrade packages. Check the output panel for details.');
+            logger.error('Failed to initialize package upgrader', error);
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`Failed to initialize: ${errorMessage}`);
         }
     });
 
-    async function handleSolutionUpdate(solutionPath: string, progress: vscode.Progress<{ message?: string }>) {
-        try {
-        // 🧠 Dependency analysis (optional - can be disabled for now)
-        let dependencyGraph;
-        try {
-            progress.report({ message: '🧠 Analyzing dependency graph...' });
-            const dependencyAnalyzer = new DependencyGraphAnalyzer(logger, copilotService);
-            dependencyGraph = await dependencyAnalyzer.analyzeSolutionDependencies(solutionPath);
-            
-            logger.info('📊 Dependency analysis completed', {
-                totalPackages: dependencyGraph.packages.size,
-                detectedFamilies: dependencyGraph.packageFamilies.size
-            });
-        } catch (error) {
-            logger.warn('Dependency analysis failed, continuing without it', error);
-            dependencyGraph = undefined;
-        }
+    context.subscriptions.push(upgradeDisposable);
 
-        // 🎯 NEW: Generate intelligent upgrade strategies  
-        progress.report({ message: '🎯 Generating upgrade strategies...' });
-        const upgradeStrategist = new UpgradeStrategist(logger, copilotService);
-        
-        // Get available updates first
-        progress.report({ message: 'Analyzing solution structure...' });
-        const projects = await packageUpgrader.getSolutionProjects(solutionPath);
-        if (projects.length === 0) {
-            vscode.window.showErrorMessage('No projects found in solution');
-            return;
-        }
-
-        // Check for updates in selected projects
-        progress.report({ message: 'Checking for package updates...' });
-        const updatesMap = await packageUpgrader.checkForUpdatesInSolution(solutionPath);
-
-        if (updatesMap.size === 0) {
-            vscode.window.showInformationMessage('All packages are up to date!');
-            return;
-        }
-
-        // 🎯 Generate upgrade strategies
-        progress.report({ message: '🎯 Generating upgrade strategies...' });
-        const strategies = await upgradeStrategist.generateUpgradeStrategies(
-            solutionPath,
-            updatesMap,
-            dependencyGraph
-        );
-
-        // 🎛️ Show strategy selection
-        const selectedStrategy = await showStrategySelectionWebview(context, strategies, logger);
-        if (!selectedStrategy) {
-            return; // User cancelled
-        }
-
-        // 🚀 Execute the selected strategy
-        await executeUpgradeStrategy(selectedStrategy, solutionPath, progress, updatesMap, packageUpgrader, generateUpdateSummary);
-        } catch (error) {
-            logger.error('Error during package upgrade', error);
-            vscode.window.showErrorMessage('Failed to upgrade packages. Check the output panel for details.');
-        }
-    }
-
-    // **NEW: Generate comprehensive update summary**
-    async function generateUpdateSummary(
-        panel: vscode.WebviewPanel, 
-        results: any, 
-        conflictAnalysis: Map<string, any>
-    ) {
-        // **NEW: Generate markdown content for the viewer**
-        const markdownContent = generateMarkdownSummary(results, conflictAnalysis);
-        panel.webview.postMessage({ type: 'updateMarkdown', content: markdownContent });
-        
-        panel.webview.postMessage({ type: 'log', text: '\n' + '='.repeat(80) });
-        panel.webview.postMessage({ type: 'log', text: '📊 UPDATE SUMMARY REPORT' });
-        panel.webview.postMessage({ type: 'log', text: '='.repeat(80) });
-        
-        // Overall statistics
-        panel.webview.postMessage({ 
-            type: 'log', 
-            text: `📈 Total Attempted: ${results.totalAttempted} | ✅ Successful: ${results.successes.length} | ❌ Failed: ${results.failures.length}` 
-        });
-        
-        if (results.successes.length > 0) {
-            panel.webview.postMessage({ type: 'log', text: '\n✅ SUCCESSFUL UPDATES:' });
-            for (const success of results.successes) {
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: `   • ${success.package} → ${success.version} (${success.project})` 
-                });
-            }
-        }
-        
-        if (results.failures.length > 0) {
-            panel.webview.postMessage({ type: 'log', text: '\n❌ FAILED UPDATES:' });
-            for (const failure of results.failures) {
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: `   • ${failure.package} (${failure.project})` 
-                });
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: `     Error: ${failure.error}` 
-                });
-                if (failure.details) {
-                    panel.webview.postMessage({ 
-                        type: 'log', 
-                        text: `     Reason: ${failure.details}` 
-                    });
-                }
-                if (failure.recommendations.length > 0) {
-                    panel.webview.postMessage({ type: 'log', text: '\n🛠️  RECOMMENDED ACTIONS:' });
-                    failure.recommendations.forEach((rec: string, index: number) => {
-                        panel.webview.postMessage({ 
-                            type: 'log', 
-                            text: `   • ${index + 1}. ${rec}` 
-                        });
-                    });
-                }
-            }
-            
-            // **NEW: Provide actionable recommendations**
-            panel.webview.postMessage({ type: 'log', text: '\n🛠️  RECOMMENDED ACTIONS:' });
-            
-            const hasVersionConflicts = results.failures.some((f: any) => f.error.includes('NU1107'));
-            const hasNetworkIssues = results.failures.some((f: any) => f.error.includes('NU1102'));
-            const hasDowngradeIssues = results.failures.some((f: any) => f.error.includes('NU1605'));
-            
-            if (hasVersionConflicts) {
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: '   1. Version Conflicts: Run "dotnet list package --include-transitive" to see full dependency tree' 
-                });
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: '   2. Update related packages to compatible versions manually' 
-                });
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: '   3. Consider using PackageReference with explicit version ranges' 
-                });
-            }
-            
-            if (hasNetworkIssues) {
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: '   • Network Issues: Check internet connection and NuGet package sources' 
-                });
-            }
-            
-            if (hasDowngradeIssues) {
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: '   • Downgrade Issues: Remove existing package first, then install desired version' 
-                });
-            }
-        }
-        
-        if (results.conflicts.length > 0) {
-            panel.webview.postMessage({ type: 'log', text: '\n🤖 AI AGENT RESOLUTIONS:' });
-            for (const conflict of results.conflicts) {
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: `   • ${conflict.package} (${conflict.project}): ${conflict.conflictDetails}` 
-                });
-            }
-        }
-        
-        // **NEW: Next steps recommendations**
-        panel.webview.postMessage({ type: 'log', text: '\n🎯 NEXT STEPS:' });
-        if (results.failures.length > 0) {
-            panel.webview.postMessage({ 
-                type: 'log', 
-                text: '   1. Review failed updates above and follow recommended actions' 
-            });
-            panel.webview.postMessage({ 
-                type: 'log', 
-                text: '   2. Run "dotnet restore" to ensure package consistency' 
-            });
-            panel.webview.postMessage({ 
-                type: 'log', 
-                text: '   3. Build solution to verify no compilation errors' 
-            });
-            panel.webview.postMessage({ 
-                type: 'log', 
-                text: '   4. Run tests to ensure functionality is preserved' 
-            });
-        } else {
-            panel.webview.postMessage({ 
-                type: 'log', 
-                text: '   1. Run "dotnet restore" to finalize package updates' 
-            });
-            panel.webview.postMessage({ 
-                type: 'log', 
-                text: '   2. Build and test your solution' 
-            });
-            panel.webview.postMessage({ 
-                type: 'log', 
-                text: '   3. Commit changes to source control' 
-            });
-        }
-        
-        panel.webview.postMessage({ type: 'log', text: '='.repeat(80) });
-        panel.webview.postMessage({ type: 'log', text: '✨ Update process completed!' });
-    }
-
-    // **NEW: Generate markdown summary for the viewer**
-    function generateMarkdownSummary(results: any, conflictAnalysis: Map<string, any>): string {
-        const timestamp = new Date().toLocaleString();
-        const successRate = results.totalAttempted > 0 ? 
-            Math.round((results.successes.length / results.totalAttempted) * 100) : 0;
-        
-        let markdown = `# 📊 .NET Package Upgrade Summary
-
-*Generated on ${timestamp}*
-
-## 📈 Overview
-
-<span class="status-badge status-info">Total Attempted: ${results.totalAttempted}</span>
-<span class="status-badge status-success">Successful: ${results.successes.length}</span>
-<span class="status-badge status-error">Failed: ${results.failures.length}</span>
-<span class="status-badge status-info">Success Rate: ${successRate}%</span>
-
----
-
-`;
-
-        // Add successful updates
-        if (results.successes.length > 0) {
-            markdown += `## ✅ Successful Updates
-
-| Package | Version | Project |
-|---------|---------|---------|
-`;
-            for (const success of results.successes) {
-                markdown += `| \`${success.package}\` | **${success.version}** | ${success.project} |\n`;
-            }
-            markdown += '\n';
-        }
-
-        // Add failed updates with detailed analysis
-        if (results.failures.length > 0) {
-            markdown += `## ❌ Failed Updates & Resolution Strategies
-
-`;
-            for (const failure of results.failures) {
-                markdown += `### 📦 ${failure.package}
-
-**Project:** ${failure.project}  
-**Error:** \`${failure.error}\`  
-`;
-                if (failure.details) {
-                    markdown += `**Reason:** ${failure.details}  \n`;
-                }
-
-                if (failure.recommendations && failure.recommendations.length > 0) {
-                    markdown += `
-**🛠️ Recommended Solutions:**
-`;
-                    failure.recommendations.forEach((rec: string, index: number) => {
-                        markdown += `${index + 1}. ${rec}\n`;
-                    });
-                }
-                markdown += '\n---\n\n';
-            }
-        }
-
-        // Add AI resolutions
-        if (results.conflicts && results.conflicts.length > 0) {
-            markdown += `## 🤖 AI Agent Conflict Resolutions
-
-`;
-            for (const conflict of results.conflicts) {
-                markdown += `### ${conflict.package} (${conflict.project})
-${conflict.conflictDetails}
-
-`;
-            }
-        }
-
-        // Add detailed conflict analysis from conflictAnalysis Map
-        if (conflictAnalysis.size > 0) {
-            markdown += `## 🔍 Detailed Conflict Analysis
-
-`;
-            for (const [packageName, analysis] of conflictAnalysis) {
-                markdown += `### 📦 ${packageName}
-
-**Recommended Version:** \`${analysis.recommendedVersion}\`
-
-**AI Analysis:** *${analysis.reasoning}*
-
-#### 🔄 Migration Steps
-`;
-                if (analysis.migrationSteps && analysis.migrationSteps.length > 0) {
-                    analysis.migrationSteps.forEach((step: string, index: number) => {
-                        markdown += `${index + 1}. ${step}\n`;
-                    });
-                } else {
-                    markdown += `- No specific migration steps identified\n`;
-                }
-
-                markdown += `
-#### ⚠️ Breaking Changes
-`;
-                if (analysis.breakingChanges && analysis.breakingChanges.length > 0) {
-                    analysis.breakingChanges.forEach((change: string) => {
-                        markdown += `- ${change}\n`;
-                    });
-                } else {
-                    markdown += `- No breaking changes identified\n`;
-                }
-
-                markdown += `
-#### 🧪 Test Impact
-`;
-                if (analysis.testImpact && analysis.testImpact.length > 0) {
-                    analysis.testImpact.forEach((impact: string) => {
-                        markdown += `- ${impact}\n`;
-                    });
-                } else {
-                    markdown += `- No test impact identified\n`;
-                }
-
-                markdown += '\n---\n\n';
-            }
-        }
-
-        // Add general recommendations
-        markdown += `## 🎯 Next Steps & Best Practices
-
-`;
-        
-        if (results.failures.length > 0) {
-            markdown += `### 🚨 Immediate Actions Required
-
-1. **Review Failed Updates:** Address each failed package using the recommended solutions above
-2. **Run Package Restore:** Execute \`dotnet restore\` to ensure package consistency
-3. **Build Verification:** Run \`dotnet build\` to verify no compilation errors
-4. **Test Validation:** Execute your test suite to ensure functionality is preserved
-
-### 🔧 Common Resolution Strategies
-
-`;
-            const hasVersionConflicts = results.failures.some((f: any) => f.error.includes('NU1107'));
-            const hasNetworkIssues = results.failures.some((f: any) => f.error.includes('NU1102'));
-            const hasDowngradeIssues = results.failures.some((f: any) => f.error.includes('NU1605'));
-            
-            if (hasVersionConflicts) {
-                markdown += `#### Version Conflicts (NU1107)
-- Run \`dotnet list package --include-transitive\` to see full dependency tree
-- Update related packages to compatible versions manually
-- Consider using PackageReference with explicit version ranges
-- Align major versions across related packages (e.g., all AWS SDK packages to v4)
-
-`;
-            }
-            
-            if (hasNetworkIssues) {
-                markdown += `#### Network Issues (NU1102)
-- Check internet connection and proxy settings
-- Verify NuGet package sources: \`dotnet nuget list source\`
-- Clear NuGet cache: \`dotnet nuget locals all --clear\`
-
-`;
-            }
-            
-            if (hasDowngradeIssues) {
-                markdown += `#### Downgrade Issues (NU1605)
-- Remove existing package: \`dotnet remove package <PackageName>\`
-- Install desired version: \`dotnet add package <PackageName> --version <Version>\`
-- Check if newer version is required by other dependencies
-
-`;
-            }
-        } else {
-            markdown += `### ✅ Success! Final Steps
-
-1. **Finalize Updates:** Run \`dotnet restore\` to ensure all packages are properly restored
-2. **Build & Test:** Execute \`dotnet build\` and run your test suite
-3. **Commit Changes:** Save your progress to source control
-4. **Documentation:** Update any relevant documentation with new package versions
-
-`;
-        }
-
-        markdown += `### 📋 Useful Commands
-
-\`\`\`bash
-# Check for outdated packages
-dotnet list package --outdated
-
-# See all package dependencies
-dotnet list package --include-transitive
-
-# Clear package cache
-dotnet nuget locals all --clear
-
-# Restore packages with verbose output
-dotnet restore --verbosity diagnostic
-
-# Build with detailed output
-dotnet build --verbosity normal
-\`\`\`
-
----
-*Generated by .NET Package Upgrader with AI Agent assistance*`;
-
-        return markdown;
-    }
-
-    // Helper to find the solution file
-    async function findSolutionFile(): Promise<string | undefined> {
-        const solutionFiles = await vscode.workspace.findFiles('**/*.sln');
-        if (solutionFiles.length === 0) {
-            vscode.window.showErrorMessage('No solution file (.sln) found in workspace.');
+    /**
+     * Find solution or project files in workspace
+     */
+    async function findSolutionOrProjectFile(): Promise<string | undefined> {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) {
+            logger.warn('No workspace folders available');
             return undefined;
         }
-        if (solutionFiles.length === 1) {
-            return solutionFiles[0].fsPath;
+
+        logger.info(`Searching for solution/project files in ${workspaceFolders.length} workspace folder(s)`);
+
+        for (const folder of workspaceFolders) {
+            logger.info(`Searching in workspace folder: ${folder.uri.fsPath}`);
+            
+            // First, look for solution files
+            const solutionFiles = await vscode.workspace.findFiles(
+                new vscode.RelativePattern(folder, '**/*.sln'),
+                '**/node_modules/**'
+            );
+            
+            logger.info(`Found ${solutionFiles.length} solution files in ${folder.uri.fsPath}`);
+            
+            if (solutionFiles.length > 0) {
+                const solutionPath = solutionFiles[0].fsPath;
+                logger.info(`Using solution file: ${solutionPath}`);
+                return solutionPath;
+            }
+
+            // If no solution files, look for project files
+            const projectFiles = await vscode.workspace.findFiles(
+                new vscode.RelativePattern(folder, '**/*.csproj'),
+                '**/node_modules/**'
+            );
+            
+            logger.info(`Found ${projectFiles.length} project files in ${folder.uri.fsPath}`);
+            
+            if (projectFiles.length > 0) {
+                const projectPath = projectFiles[0].fsPath;
+                logger.info(`Using project file: ${projectPath}`);
+                return projectPath;
+            }
         }
-        const picked = await vscode.window.showQuickPick(
-            solutionFiles.map(f => f.fsPath),
-            { placeHolder: 'Select the solution file to use' }
-        );
-        return picked;
+
+        logger.warn('No .sln or .csproj files found in any workspace folder');
+        return undefined;
     }
 
-    // **NEW: Enhanced webview function that includes AI analysis**
-    async function showUpdateWebviewWithAnalysis(
-        context: vscode.ExtensionContext,
-        updatesMap: Map<string, PackageUpdate[]>,
-        conflictAnalysis: Map<string, any>,
-        logger: Logger,
-        onApply: (selected: { [project: string]: string[] }, panel: vscode.WebviewPanel) => Promise<void>,
-        singleProjectName?: string
-    ) {
+    /**
+     * Show the upgrade options webview
+     */
+    async function showUpgradeOptionsWebview(solutionPath: string, logger: Logger) {
         const panel = vscode.window.createWebviewPanel(
-            'packageUpdates',
-            'Package Updates',
+            'packageUpgradeOptions',
+            '.NET Package Upgrader',
             vscode.ViewColumn.One,
-            { enableScripts: true }
+            {
+                enableScripts: true,
+                retainContextWhenHidden: true
+            }
         );
 
-        let html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>.NET Package Upgrader</title>
-    <style>
-        body { font-family: "Segoe UI", Arial, sans-serif; background: #f3f3f3; margin: 0; padding: 0; }
-        .header { background: #0078d4; color: #fff; padding: 24px 32px 16px 32px; box-shadow: 0 2px 4px rgba(0,0,0,0.04); }
-        .header h1 { margin: 0 0 4px 0; font-size: 2rem; font-weight: 600; letter-spacing: 0.5px; }
-        .header h2 { margin: 0; font-size: 1.2rem; font-weight: 400; color: #c7e0f4; }
-        .container { margin: 32px auto; max-width: 1200px; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); padding: 32px; }
-        table { width: 100%; border-collapse: collapse; margin-bottom: 24px; }
-        th, td { padding: 10px 12px; text-align: left; }
-        th { background: #e5e5e5; color: #222; font-weight: 600; border-bottom: 2px solid #c8c8c8; }
-        tr:nth-child(even) { background: #f9f9f9; }
-        tr:hover { background: #e6f2fb; }
-        button { background: #0078d4; color: #fff; border: none; border-radius: 4px; padding: 10px 24px; font-size: 1rem; font-weight: 500; cursor: pointer; transition: background 0.2s; margin-bottom: 16px; }
-        button:disabled { background: #b3d6f2; color: #fff; cursor: not-allowed; }
-        button:hover:enabled { background: #005a9e; }
-        #progress { margin-top: 20px; }
-        #log { margin-top: 20px; background: #f4f4f4; padding: 10px; height: 120px; overflow: auto; border-radius: 4px; border: 1px solid #e1e1e1; font-size: 0.95rem; }
-        
-        /* **NEW: Markdown Viewer Styles** */
-        .markdown-viewer-container { margin-top: 24px; }
-        .markdown-viewer-header { 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
-            background: #f8f9fa; 
-            padding: 12px 16px; 
-            border: 1px solid #dee2e6; 
-            border-bottom: none; 
-            border-radius: 6px 6px 0 0; 
-        }
-        .markdown-viewer-header h3 { 
-            margin: 0; 
-            font-size: 1.1rem; 
-            color: #495057; 
-            display: flex; 
-            align-items: center; 
-        }
-        .markdown-viewer-header h3::before { 
-            content: "📋"; 
-            margin-right: 8px; 
-        }
-        .markdown-toggle { 
-            background: #6c757d; 
-            color: white; 
-            border: none; 
-            padding: 4px 12px; 
-            border-radius: 4px; 
-            font-size: 0.85rem; 
-            cursor: pointer; 
-        }
-        .markdown-toggle:hover { background: #5a6268; }
-        .markdown-viewer { 
-            background: #fff; 
-            border: 1px solid #dee2e6; 
-            border-radius: 0 0 6px 6px; 
-            max-height: 400px; 
-            overflow: auto; 
-            padding: 20px; 
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; 
-            line-height: 1.6; 
-        }
-        .markdown-viewer.collapsed { display: none; }
-        
-        /* Markdown Content Styling */
-        .markdown-viewer h1, .markdown-viewer h2, .markdown-viewer h3, .markdown-viewer h4 { 
-            margin: 24px 0 16px 0; 
-            font-weight: 600; 
-            line-height: 1.25; 
-        }
-        .markdown-viewer h1 { font-size: 2rem; border-bottom: 1px solid #eaecef; padding-bottom: 10px; }
-        .markdown-viewer h2 { font-size: 1.5rem; border-bottom: 1px solid #eaecef; padding-bottom: 8px; }
-        .markdown-viewer h3 { font-size: 1.25rem; }
-        .markdown-viewer h4 { font-size: 1rem; }
-        .markdown-viewer p { margin: 16px 0; }
-        .markdown-viewer ul, .markdown-viewer ol { margin: 16px 0; padding-left: 30px; }
-        .markdown-viewer li { margin: 8px 0; }
-        .markdown-viewer code { 
-            background: #f6f8fa; 
-            padding: 2px 6px; 
-            border-radius: 3px; 
-            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; 
-            font-size: 0.85em; 
-        }
-        .markdown-viewer pre { 
-            background: #f6f8fa; 
-            padding: 16px; 
-            border-radius: 6px; 
-            overflow: auto; 
-            margin: 16px 0; 
-            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; 
-            font-size: 0.85em; 
-        }
-        .markdown-viewer blockquote { 
-            border-left: 4px solid #dfe2e5; 
-            padding: 0 16px; 
-            color: #6a737d; 
-            margin: 16px 0; 
-        }
-        .markdown-viewer table { 
-            border-collapse: collapse; 
-            margin: 16px 0; 
-            width: 100%; 
-        }
-        .markdown-viewer table th, .markdown-viewer table td { 
-            border: 1px solid #dfe2e5; 
-            padding: 6px 13px; 
-            text-align: left; 
-        }
-        .markdown-viewer table th { 
-            background: #f6f8fa; 
-            font-weight: 600; 
-        }
-        .markdown-viewer .status-badge { 
-            display: inline-block; 
-            padding: 2px 8px; 
-            border-radius: 12px; 
-            font-size: 0.75rem; 
-            font-weight: 500; 
-            margin-right: 8px; 
-        }
-        .markdown-viewer .status-success { background: #d4edda; color: #155724; }
-        .markdown-viewer .status-error { background: #f8d7da; color: #721c24; }
-        .markdown-viewer .status-warning { background: #fff3cd; color: #856404; }
-        .markdown-viewer .status-info { background: #d1ecf1; color: #0c5460; }
-        
-        .project-section { margin-bottom: 32px; }
-        .project-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 8px; color: #0078d4; }
-        
-        /* **NEW: Styles for AI analysis sections** */
-        .ai-analysis-section { background: #f0f8ff; border-left: 4px solid #0078d4; margin: 24px 0; padding: 16px; border-radius: 0 4px 4px 0; }
-        .ai-analysis-title { font-size: 1.2rem; font-weight: 600; color: #0078d4; margin-bottom: 12px; display: flex; align-items: center; }
-        .ai-analysis-title::before { content: "🤖"; margin-right: 8px; }
-        .conflict-warning { background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 4px; padding: 12px; margin: 12px 0; }
-        .conflict-warning h4 { margin: 0 0 8px 0; color: #856404; }
-        .analysis-details { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px; }
-        .analysis-card { background: #fff; border: 1px solid #dee2e6; border-radius: 4px; padding: 12px; }
-        .analysis-card h5 { margin: 0 0 8px 0; color: #495057; font-size: 0.9rem; font-weight: 600; }
-        .analysis-card ul { margin: 4px 0; padding-left: 16px; }
-        .analysis-card li { margin: 4px 0; font-size: 0.85rem; }
-        .toggle-details { cursor: pointer; color: #0078d4; font-size: 0.9rem; margin-top: 8px; }
-        .toggle-details:hover { text-decoration: underline; }
-        .details-hidden { display: none; }
-        .reasoning-text { font-style: italic; color: #6c757d; margin: 8px 0; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>.NET Package Upgrader</h1>
-        <h2>AI-Powered Package Updates${singleProjectName ? ` for <span style=\"color:#fff;\">${singleProjectName}</span>` : ''}</h2>
-    </div>
-    <div class="container">
-`;
+        // Get solution name for display
+        const solutionName = require('path').basename(solutionPath, '.sln');
 
-        // **NEW: Display AI analysis section if conflicts were detected**
-        if (conflictAnalysis.size > 0) {
-            html += `
-        <div class="ai-analysis-section">
-            <div class="ai-analysis-title">AI Agent Analysis Results</div>
-            <p>The AI Agent has analyzed your packages and detected potential version conflicts. Review the recommendations below:</p>
-`;
-            
-            for (const [packageName, analysis] of conflictAnalysis) {
-                html += `
-            <div class="conflict-warning">
-                <h4>📦 ${packageName}</h4>
-                <p><strong>Recommended Version:</strong> ${analysis.recommendedVersion}</p>
-                <p class="reasoning-text">${analysis.reasoning}</p>
-                
-                <div class="toggle-details" onclick="toggleDetails('${packageName}')">▼ Show detailed analysis</div>
-                <div id="details-${packageName}" class="details-hidden">
-                    <div class="analysis-details">
-                        <div class="analysis-card">
-                            <h5>Migration Steps</h5>
-                            <ul>
-                                ${analysis.migrationSteps.map((step: string) => `<li>${step}</li>`).join('')}
-                            </ul>
-                        </div>
-                        <div class="analysis-card">
-                            <h5>Breaking Changes</h5>
-                            <ul>
-                                ${analysis.breakingChanges.map((change: string) => `<li>${change}</li>`).join('')}
-                            </ul>
-                        </div>
-                        <div class="analysis-card">
-                            <h5>Compatibility Notes</h5>
-                            <ul>
-                                ${analysis.compatibilityNotes.map((note: string) => `<li>${note}</li>`).join('')}
-                            </ul>
-                        </div>
-                        <div class="analysis-card">
-                            <h5>Test Impact</h5>
-                            <ul>
-                                ${analysis.testImpact.map((impact: string) => `<li>${impact}</li>`).join('')}
-                            </ul>
-                        </div>
-                    </div>
-                </div>
-            </div>
-`;
-            }
-            
-            html += `
-        </div>
-`;
-        }
+        // Set the webview HTML content
+        panel.webview.html = generateUpgradeOptionsHTML(solutionName, solutionPath);
 
-        // Display the packages table as before
-        for (const [project, updates] of updatesMap) {
-            html += `
-        <div class="project-section">
-            <div class="project-title">${project}</div>
-            <table>
-                <tr>
-                    <th>Update?</th>
-                    <th>Package</th>
-                    <th>Current</th>
-                    <th>Latest</th>
-                    <th>AI Recommended</th>
-                    <th>Breaking Changes</th>
-                    <th>Migration Complexity</th>
-                </tr>
-                ${updates.map(update => {
-                    const conflict = conflictAnalysis.get(update.packageName);
-                    const aiRecommended = conflict ? conflict.recommendedVersion : update.recommendedVersion;
-                    const hasConflictResolution = conflict ? '🤖' : '';
-                    return `
-                <tr>
-                    <td><input type="checkbox" checked data-project="${project}" data-pkg="${update.packageName}"></td>
-                    <td>${update.packageName} ${hasConflictResolution}</td>
-                    <td>${update.currentVersion}</td>
-                    <td>${update.recommendedVersion}</td>
-                    <td><strong>${aiRecommended}</strong></td>
-                    <td>${update.hasBreakingChanges ? 'Yes' : 'No'}</td>
-                    <td>${update.migrationComplexity || 'low'}</td>
-                </tr>
-                `;
-                }).join('')}
-            </table>
-        </div>
-`;
-        }
-
-        html += `
-        <button id="applyBtn" onclick="applyUpdates()">Apply AI-Recommended Updates</button>
-        <div id="progress"></div>
-        <div id="log">AI Agent ready to apply updates...</div>
-        
-        <!-- **NEW: Markdown Viewer Section** -->
-        <div class="markdown-viewer-container">
-            <div class="markdown-viewer-header">
-                <h3>Package Upgrade Summary & Resolution Guide</h3>
-                <button class="markdown-toggle" onclick="toggleMarkdownViewer()">Hide</button>
-            </div>
-            <div id="markdownViewer" class="markdown-viewer">
-                <div style="text-align: center; color: #6c757d; padding: 40px;">
-                    <p>📊 Upgrade summary will appear here after processing...</p>
-                    <p><em>This section will show detailed analysis, conflicts, and resolution strategies</em></p>
-                </div>
-            </div>
-        </div>
-    </div>
-    <script>
-        const vscode = acquireVsCodeApi();
-        const applyBtn = document.getElementById('applyBtn');
-        let markdownViewerCollapsed = false;
-        
-        // **NEW: Markdown viewer toggle functionality**
-        function toggleMarkdownViewer() {
-            const viewer = document.getElementById('markdownViewer');
-            const toggle = document.querySelector('.markdown-toggle');
-            markdownViewerCollapsed = !markdownViewerCollapsed;
-            
-            if (markdownViewerCollapsed) {
-                viewer.classList.add('collapsed');
-                toggle.textContent = 'Show';
-            } else {
-                viewer.classList.remove('collapsed');
-                toggle.textContent = 'Hide';
-            }
-        }
-        
-        // **NEW: Simple markdown to HTML converter**
-        function markdownToHtml(markdown) {
-            let html = markdown
-                // Headers
-                .replace(/^### (.*$)/gim, '<h3>$1</h3>')
-                .replace(/^## (.*$)/gim, '<h2>$1</h2>')
-                .replace(/^# (.*$)/gim, '<h1>$1</h1>')
-                // Bold and italic
-                .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
-                .replace(/\\*(.*?)\\*/g, '<em>$1</em>')
-                // Code blocks
-                .replace(/\`\`\`([\\s\\S]*?)\`\`\`/g, '<pre><code>$1</code></pre>')
-                // Inline code
-                .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
-                // Lists
-                .replace(/^\\* (.*$)/gim, '<li>$1</li>')
-                .replace(/^- (.*$)/gim, '<li>$1</li>')
-                // Blockquotes
-                .replace(/^> (.*$)/gim, '<blockquote>$1</blockquote>')
-                // Line breaks
-                .replace(/\\n/g, '<br>');
-            
-            // Wrap consecutive <li> elements in <ul>
-            html = html.replace(/(<li>.*?<\\/li>)(\\s*<li>.*?<\\/li>)*/g, function(match) {
-                return '<ul>' + match + '</ul>';
-            });
-            
-            return html;
-        }
-        
-        // **NEW: Update markdown viewer with content**
-        function updateMarkdownViewer(markdownContent) {
-            const viewer = document.getElementById('markdownViewer');
-            const htmlContent = markdownToHtml(markdownContent);
-            viewer.innerHTML = htmlContent;
-        }
-        
-        function toggleDetails(packageName) {
-            const details = document.getElementById('details-' + packageName);
-            const toggle = document.querySelector('[onclick*="' + packageName + '"]');
-            if (details.classList.contains('details-hidden')) {
-                details.classList.remove('details-hidden');
-                toggle.textContent = '▲ Hide detailed analysis';
-            } else {
-                details.classList.add('details-hidden');
-                toggle.textContent = '▼ Show detailed analysis';
-            }
-        }
-        
-        function applyUpdates() {
-            applyBtn.disabled = true;
-            const selected = {};
-            Array.from(document.querySelectorAll('input[type=checkbox]:checked')).forEach(cb => {
-                const project = cb.getAttribute('data-project');
-                const pkg = cb.getAttribute('data-pkg');
-                if (!selected[project]) selected[project] = [];
-                selected[project].push(pkg);
-            });
-            vscode.postMessage({ command: 'applyUpdates', selected });
-        }
-        
-        window.addEventListener('message', event => {
-            const msg = event.data;
-            if (msg.type === 'progress') {
-                document.getElementById('progress').innerHTML = '<progress value="' + msg.value + '" max="' + msg.max + '"></progress> ' + msg.text;
-            }
-            if (msg.type === 'log') {
-                const logDiv = document.getElementById('log');
-                logDiv.innerHTML += '<div>' + msg.text + '</div>';
-                logDiv.scrollTop = logDiv.scrollHeight;
-            }
-            if (msg.type === 'disableButton') {
-                applyBtn.disabled = true;
-            }
-            if (msg.type === 'enableButton') {
-                applyBtn.disabled = false;
-            }
-            // **NEW: Handle markdown viewer updates**
-            if (msg.type === 'updateMarkdown') {
-                updateMarkdownViewer(msg.content);
-            }
-        });
-    </script>
-</body>
-</html>`;
-
-        panel.webview.html = html;
-
+        // Handle messages from the webview
         panel.webview.onDidReceiveMessage(
-            async message => {
-                if (message.command === 'applyUpdates') {
-                    panel.webview.postMessage({ type: 'log', text: 'Starting AI-guided update process...' });
-                    await onApply(message.selected, panel);
+            async (message) => {
+                switch (message.command) {
+                    case 'upgradeAll':
+                        logger.info('User selected: Upgrade All Packages');
+                        await showUpgradeProgressPage(panel, solutionPath, logger);
+                        break;
+                                    case 'upgradeVulnerabilities':
+                    logger.info('User selected: Upgrade Based on Vulnerabilities');
+                    await handleUpgradeVulnerabilities(panel, solutionPath, logger);
+                    break;
+                case 'codeReview':
+                    logger.info('User selected: Code Review Based on Checklist');
+                    await handleCodeReview(panel, solutionPath, logger);
+                    break;
+                case 'cancel':
+                    logger.info('User cancelled upgrade');
+                    panel.dispose();
+                    break;
                 }
             },
             undefined,
@@ -901,551 +135,2045 @@ dotnet build --verbosity normal
         );
     }
 
-    // Helper function to find which family a package belongs to
-    function findPackageFamily(packageName: string, families: Map<string, string[]>): string | undefined {
-        for (const [familyName, packages] of families) {
-            if (packages.includes(packageName)) {
-                return familyName;
+    /**
+     * Show dedicated upgrade progress page
+     */
+    async function showUpgradeProgressPage(panel: vscode.WebviewPanel, solutionPath: string, logger: Logger) {
+        // Update panel title and show progress page
+        panel.title = 'Package Upgrade Progress';
+        panel.webview.html = generateProgressPageHTML();
+
+        // Start the upgrade process
+        const packageUpgrader = new PackageUpgrader(logger);
+        
+        // Set up progress callback
+        packageUpgrader.onProgress = (message: string, type: 'info' | 'success' | 'error' | 'warning' = 'info') => {
+                panel.webview.postMessage({ 
+                command: 'addLog',
+                message,
+                type,
+                timestamp: new Date().toLocaleTimeString()
+            });
+        };
+
+        try {
+            // Send initial message
+                panel.webview.postMessage({ 
+                command: 'setStatus',
+                status: 'running',
+                message: 'Starting package upgrade process...'
+                });
+
+            const { results, restoreErrors, strategy, summary } = await packageUpgrader.upgradePackages(solutionPath);
+
+            // Send completion message
+                panel.webview.postMessage({ 
+                command: 'setStatus',
+                status: 'completed',
+                message: 'Package upgrade completed!'
+                });
+            
+            // Send final results
+                panel.webview.postMessage({ 
+                command: 'showResults',
+                results,
+                restoreErrors,
+                strategy,
+                summary
+            });
+
+        } catch (error) {
+            logger.error('Upgrade failed', error);
+                panel.webview.postMessage({ 
+                command: 'setStatus',
+                status: 'error',
+                message: `Upgrade failed: ${error instanceof Error ? error.message : String(error)}`
+                });
             }
         }
-        return undefined;
+        
+    /**
+     * Handle upgrade based on vulnerabilities (placeholder)
+     */
+    async function handleUpgradeVulnerabilities(panel: vscode.WebviewPanel, solutionPath: string, logger: Logger) {
+        panel.webview.html = generateVulnerabilityScanHTML();
     }
 
-    // Register the Copilot agent
-    context.subscriptions.push(copilotService);
-
-    context.subscriptions.push(disposable);
-}
-
-export function deactivate() {
-    // Cleanup code here
-}
-
-interface ProjectItem {
-    label: string;
-    description: string;
-    projectPath: string;
-}
-
-/**
- * 🎛️ Show strategy selection interface
- */
-async function showStrategySelectionWebview(
-    context: vscode.ExtensionContext,
-    strategies: UpgradeStrategy[],
-    logger: Logger
-): Promise<UpgradeStrategy | undefined> {
-    
-    return new Promise((resolve) => {
-        const panel = vscode.window.createWebviewPanel(
-            'upgradeStrategy',
-            'Choose Upgrade Strategy',
-            vscode.ViewColumn.One,
-            { enableScripts: true }
-        );
-
-        panel.webview.html = generateStrategySelectionHTML(strategies);
+    /**
+     * Handle code review based on predefined checklist with AI analysis
+     */
+    async function handleCodeReview(panel: vscode.WebviewPanel, solutionPath: string, logger: Logger) {
+        // Show initial loading page
+        panel.webview.html = generateCodeReviewHTML(solutionPath);
         
-        panel.webview.onDidReceiveMessage(
-            (message) => {
-                switch (message.command) {
-                    case 'selectStrategy':
-                        resolve(strategies[message.strategyIndex]);
-                        panel.dispose();
-                        break;
-                    case 'cancel':
-                        resolve(undefined);
-                        panel.dispose();
-                        break;
+        // Start AI-powered code analysis
+        setTimeout(async () => {
+            try {
+                await performAICodeAnalysis(panel, solutionPath, logger);
+            } catch (error) {
+                logger.error('AI code analysis failed', error);
+                panel.webview.postMessage({
+                    command: 'analysisError',
+                    error: error instanceof Error ? error.message : String(error)
+                });
+            }
+        }, 1000);
+    }
+
+    /**
+     * Perform AI-powered code analysis using Copilot
+     */
+    async function performAICodeAnalysis(panel: vscode.WebviewPanel, solutionPath: string, logger: Logger) {
+        const analysisStartTime = Date.now();
+        logger.info('🤖 Starting AI-powered code analysis...', { 
+            solutionPath,
+            timestamp: new Date().toISOString()
+        });
+        
+        panel.webview.postMessage({ command: 'startAnalysis' });
+
+        try {
+            // Check if Language Model API is available
+            logger.info('🔍 Checking Language Model API availability...');
+            if (!vscode.lm) {
+                logger.error('❌ Language Model API not available - VS Code version may be too old');
+                throw new Error('Language Model API not available - please update VS Code to latest version');
+            }
+            logger.info('✅ Language Model API is available');
+
+            // Get available Copilot models
+            logger.info('🔍 Searching for available Copilot models...');
+            const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+            
+            if (models.length === 0) {
+                logger.error('❌ No Copilot language models available', {
+                    possibleCauses: [
+                        'GitHub Copilot extension not installed',
+                        'GitHub Copilot not activated/licensed', 
+                        'User not signed in to GitHub',
+                        'Copilot Chat feature disabled'
+                    ]
+                });
+                throw new Error('No Copilot language models available - please check GitHub Copilot installation and licensing');
+            }
+
+            // Log available models
+            logger.info(`✅ Found ${models.length} available Copilot model(s)`, {
+                models: models.map(m => ({
+                    id: m.id,
+                    vendor: m.vendor,
+                    family: m.family,
+                    version: m.version,
+                    maxInputTokens: m.maxInputTokens,
+                    countTokens: !!m.countTokens
+                }))
+            });
+
+            // Select and log the chosen model
+            const model = models[0];
+            logger.info('🚀 Selected Copilot model for analysis', { 
+                selectedModel: {
+                    id: model.id,
+                    vendor: model.vendor,
+                    family: model.family,
+                    version: model.version,
+                    maxInputTokens: model.maxInputTokens
                 }
-            }
-        );
-    });
-}
+            });
 
-/**
- * 🎨 Generate HTML for strategy selection
- */
-function generateStrategySelectionHTML(strategies: UpgradeStrategy[]): string {
-    return `
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <style>
-            body { font-family: var(--vscode-font-family); padding: 20px; color: var(--vscode-foreground); background: var(--vscode-editor-background); }
-            .strategy-card { 
-                border: 1px solid var(--vscode-panel-border);
-                margin: 15px 0; padding: 20px; border-radius: 8px;
-                background: var(--vscode-editor-background);
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            }
-            .strategy-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-            .strategy-title { font-size: 18px; font-weight: bold; margin: 0; }
-            .risk-badge { padding: 4px 12px; border-radius: 4px; font-size: 12px; font-weight: bold; text-transform: uppercase; }
-            .risk-low { background: #0e7245; color: white; }
-            .risk-medium { background: #f59e0b; color: white; }
-            .risk-high { background: #dc2626; color: white; }
-            .strategy-description { margin: 10px 0; color: var(--vscode-descriptionForeground); }
-            .phase-list { margin: 15px 0; }
-            .phase-item { 
-                margin: 8px 0; padding: 12px; 
-                background: var(--vscode-input-background); 
-                border-radius: 4px; border-left: 3px solid var(--vscode-button-background);
-            }
-            .phase-title { font-weight: bold; margin-bottom: 5px; }
-            .phase-description { font-size: 14px; color: var(--vscode-descriptionForeground); }
-            .ai-recommendation { 
-                background: var(--vscode-textCodeBlock-background); 
-                padding: 15px; margin: 15px 0; border-radius: 6px;
-                border-left: 4px solid #0078d4;
-            }
-            .pros-cons { display: flex; gap: 20px; margin: 15px 0; }
-            .pros, .cons { flex: 1; }
-            .pros h4 { color: #0e7245; margin: 0 0 8px 0; }
-            .cons h4 { color: #dc2626; margin: 0 0 8px 0; }
-            .pros ul, .cons ul { margin: 0; padding-left: 20px; }
-            .pros li, .cons li { margin: 4px 0; }
-            button { 
-                background: var(--vscode-button-background); 
-                color: var(--vscode-button-foreground);
-                border: none; padding: 12px 24px; border-radius: 4px; cursor: pointer;
-                font-size: 14px; font-weight: bold;
-                transition: background-color 0.2s;
-            }
-            button:hover { background: var(--vscode-button-hoverBackground); }
-            .button-container { text-align: right; margin-top: 15px; }
-            .footer { text-align: center; margin-top: 30px; }
-            .footer button { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
-        </style>
-    </head>
-    <body>
-        <h1>🎯 Choose Your Upgrade Strategy</h1>
-        <p>AI has analyzed your dependencies and generated optimized upgrade strategies:</p>
-        
-        ${strategies.map((strategy, index) => `
-            <div class="strategy-card">
-                <div class="strategy-header">
-                    <h3 class="strategy-title">${strategy.name}</h3>
-                    <div>
-                        <span class="risk-badge risk-${strategy.estimatedRisk}">${strategy.estimatedRisk} risk</span>
-                        <span style="margin-left: 10px; color: var(--vscode-descriptionForeground);">⏱️ ${strategy.estimatedTime}</span>
-                    </div>
-                </div>
-                
-                <p class="strategy-description">${strategy.description}</p>
-                
-                ${strategy.aiRecommendation ? `
-                    <div class="ai-recommendation">
-                        <strong>🤖 AI Recommendation:</strong> ${strategy.aiRecommendation}
-                    </div>
-                ` : ''}
-                
-                <div class="phase-list">
-                    <strong>📋 Upgrade Phases (${strategy.phases.length}):</strong>
-                    ${strategy.phases.slice(0, 3).map(phase => `
-                        <div class="phase-item">
-                            <div class="phase-title">${phase.name} (${phase.packageUpdates.length} packages)</div>
-                            <div class="phase-description">${phase.description}</div>
-                        </div>
-                    `).join('')}
-                    ${strategy.phases.length > 3 ? `<div style="text-align: center; color: var(--vscode-descriptionForeground); font-style: italic;">... and ${strategy.phases.length - 3} more phases</div>` : ''}
-                </div>
-                
-                <div class="pros-cons">
-                    <div class="pros">
-                        <h4>✅ Pros:</h4>
-                        <ul>
-                            ${strategy.pros.map(pro => `<li>${pro}</li>`).join('')}
-                        </ul>
-                    </div>
-                    <div class="cons">
-                        <h4>⚠️ Cons:</h4>
-                        <ul>
-                            ${strategy.cons.map(con => `<li>${con}</li>`).join('')}
-                        </ul>
-                    </div>
-                </div>
-                
-                <div class="button-container">
-                    <button onclick="selectStrategy(${index})">Choose This Strategy</button>
-                </div>
-            </div>
-        `).join('')}
-        
-        <div class="footer">
-            <button onclick="cancel()">Cancel</button>
-        </div>
-        
-        <script>
-            const vscode = acquireVsCodeApi();
+            // Log analysis plan
+            logger.info('📋 Analysis plan: 4 parallel AI evaluations', {
+                categories: [
+                    'Code Architecture & Design (SOLID, DI, Naming)',
+                    'Security & Best Practices (Secrets, Validation, Error Handling)',
+                    'Testing & Quality (Unit Tests, Integration Tests, Static Analysis)',
+                    'Package Dependencies (Security, Unused Packages, Compatibility)'
+                ],
+                analysisMethod: 'Parallel execution for optimal performance'
+            });
+
+            // Analyze each checklist category with detailed logging
+            logger.info('🔄 Starting parallel AI analysis of all categories...');
+            const categoryStartTime = Date.now();
             
-            function selectStrategy(index) {
-                vscode.postMessage({ command: 'selectStrategy', strategyIndex: index });
-            }
+            const analysisResults = await Promise.all([
+                analyzeCodeArchitecture(model, solutionPath, logger),
+                analyzeSecurityPractices(model, solutionPath, logger),
+                analyzeTestingQuality(model, solutionPath, logger),
+                analyzePackageDependencies(model, solutionPath, logger)
+            ]);
+
+            const categoryDuration = Date.now() - categoryStartTime;
+            logger.info('✅ All AI analysis categories completed', {
+                duration: `${categoryDuration}ms`,
+                resultsReceived: analysisResults.length
+            });
+
+            // Log analysis summary
+            const summary = generateAnalysisSummary(analysisResults);
+            logger.info('📊 AI Analysis Summary', summary);
+
+            // Send results to webview
+            panel.webview.postMessage({
+                command: 'analysisComplete',
+                results: {
+                    architecture: analysisResults[0],
+                    security: analysisResults[1],
+                    testing: analysisResults[2],
+                    packages: analysisResults[3]
+                }
+            });
+
+            const totalDuration = Date.now() - analysisStartTime;
+            logger.info('🎉 AI-powered code analysis completed successfully', {
+                totalDuration: `${totalDuration}ms`,
+                averagePerCategory: `${Math.round(totalDuration / 4)}ms`,
+                timestamp: new Date().toISOString()
+            });
+
+        } catch (error) {
+            const totalDuration = Date.now() - analysisStartTime;
+            logger.error('💥 AI analysis failed', {
+                error: error instanceof Error ? error.message : String(error),
+                errorType: error instanceof Error ? error.constructor.name : 'Unknown',
+                duration: `${totalDuration}ms`,
+                solutionPath,
+                timestamp: new Date().toISOString(),
+                stack: error instanceof Error ? error.stack : undefined
+            });
             
-            function cancel() {
-                vscode.postMessage({ command: 'cancel' });
+            panel.webview.postMessage({
+                command: 'analysisError',
+                error: error instanceof Error ? error.message : String(error)
+            });
+        }
+    }
+
+    /**
+     * Generate analysis summary for logging
+     */
+    function generateAnalysisSummary(analysisResults: any[]) {
+        const [architecture, security, testing, packages] = analysisResults;
+        
+        const totalRecommendations = [
+            ...Object.values(architecture || {}),
+            ...Object.values(security || {}),
+            ...Object.values(testing || {}),
+            ...Object.values(packages || {})
+        ].reduce((count, category: any) => {
+            return count + (category?.recommendations?.length || 0);
+        }, 0);
+
+        const scores = [
+            ...Object.values(architecture || {}),
+            ...Object.values(security || {}),
+            ...Object.values(testing || {}),
+            ...Object.values(packages || {})
+        ].map((category: any) => category?.score || 0).filter((score: number) => score > 0);
+        
+        const averageScore = scores.length > 0 ? scores.reduce((sum: number, score: number) => sum + score, 0) / scores.length : 0;
+
+        const criticalIssues = [
+            ...Object.values(architecture || {}),
+            ...Object.values(security || {}),
+            ...Object.values(testing || {}),
+            ...Object.values(packages || {})
+        ].filter((category: any) => category?.status === 'FAIL').length;
+
+        return {
+            totalRecommendations,
+            averageScore: Math.round(averageScore * 10) / 10,
+            criticalIssues,
+            statusBreakdown: {
+                architecture: Object.values(architecture || {}).map((c: any) => c?.status).filter(Boolean),
+                security: Object.values(security || {}).map((c: any) => c?.status).filter(Boolean),
+                testing: Object.values(testing || {}).map((c: any) => c?.status).filter(Boolean),
+                packages: Object.values(packages || {}).map((c: any) => c?.status).filter(Boolean)
             }
-        </script>
-    </body>
-    </html>`;
-}
+        };
+    }
 
-/**
- * 🚀 Execute the selected upgrade strategy
- */
-async function executeUpgradeStrategy(
-    strategy: UpgradeStrategy,
-    solutionPath: string,
-    progress: vscode.Progress<{ message?: string }>,
-    updatesMap: Map<string, PackageUpdate[]>,
-    packageUpgrader: PackageUpgrader,
-    generateUpdateSummary: (panel: vscode.WebviewPanel, results: any, conflictAnalysis: Map<string, any>) => Promise<void>
-): Promise<void> {
-    
-    progress.report({ message: `🚀 Executing ${strategy.name}...` });
-    
-    const updateResults = {
-        successes: [] as Array<{package: string, project: string, version: string}>,
-        failures: [] as Array<{package: string, project: string, error: string, details?: string, recommendations: string[]}>,
-        conflicts: [] as Array<{package: string, project: string, conflictDetails: string}>,
-        totalAttempted: 0
-    };
+    /**
+     * Analyze code architecture using AI
+     */
+    async function analyzeCodeArchitecture(model: any, solutionPath: string, logger: Logger) {
+        const prompt = `You are a senior software architect providing a code review assessment for a .NET solution upgrade.
 
-    updateResults.totalAttempted = strategy.phases.reduce((sum, phase) => sum + phase.packageUpdates.length, 0);
+TASK: Provide a realistic architecture assessment for a typical .NET solution that may have common architectural issues.
 
-    const panel = vscode.window.createWebviewPanel(
-        'upgradeExecution',
-        `Executing ${strategy.name}`,
-        vscode.ViewColumn.One,
-        { enableScripts: true }
-    );
+CONTEXT: This is for a .NET solution located at: ${solutionPath}
 
-    panel.webview.html = generateEnhancedExecutionHTML(strategy);
-    
-    for (const phase of strategy.phases.sort((a, b) => a.order - b.order)) {
-        panel.webview.postMessage({ 
-            type: 'log', 
-            text: `🎯 Starting Phase ${phase.order}: ${phase.name}` 
+ANALYSIS CRITERIA:
+1. SOLID Principles Implementation
+2. Dependency Injection Usage  
+3. Naming Conventions Adherence
+
+INSTRUCTIONS:
+- Provide realistic scores and feedback based on common .NET architecture patterns
+- Give specific, actionable recommendations with example file paths and method names
+- Focus on typical issues found in .NET applications (controllers, services, repositories)
+- Include realistic file paths like Controllers/, Services/, Models/, etc.
+
+Respond ONLY with a valid JSON object in this exact format:
+{
+  "solidPrinciples": {
+    "status": "PASS|FAIL|WARNING",
+    "score": 8,
+    "feedback": "Found violations in UserService.cs - the class handles both user management and email sending, violating SRP",
+    "recommendations": [
+      "Extract email functionality from UserService.cs into separate EmailService class",
+      "Create IUserRepository interface in UserService.cs line 45-60 to apply DIP",
+      "Split UserController.ProcessUserRequest() method (lines 120-180) - too many responsibilities"
+    ]
+  },
+  "dependencyInjection": {
+    "status": "PASS|FAIL|WARNING", 
+    "score": 6,
+    "feedback": "Manual object creation found in several controllers, not using DI container properly",
+    "recommendations": [
+      "Replace 'new UserService()' instantiation in HomeController.cs line 23 with constructor injection",
+      "Add IUserService registration in Program.cs or Startup.cs ConfigureServices method",
+      "Remove static dependencies in EmailService.cs line 15 - inject IEmailProvider instead"
+    ]
+  },
+  "namingConventions": {
+    "status": "PASS|FAIL|WARNING",
+    "score": 7,
+    "feedback": "Most naming follows C# conventions, but found inconsistencies in private fields and async methods",
+    "recommendations": [
+      "Rename private field 'userData' to '_userData' in UserService.cs line 12 (follow underscore convention)",
+      "Add 'Async' suffix to UserRepository.GetUser() method in UserRepository.cs line 34",
+      "Rename class 'dataHelper' to 'DataHelper' in Utils/dataHelper.cs (PascalCase for class names)"
+    ]
+  }
+}`;
+
+        const startTime = Date.now();
+        logger.info('🏗️ Starting Architecture Analysis', { 
+            category: 'Code Architecture & Design',
+            criteria: ['SOLID Principles', 'Dependency Injection', 'Naming Conventions']
         });
 
-        for (const update of phase.packageUpdates) {
+        try {
+            const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+            logger.info('📤 Sending architecture analysis prompt to Copilot', {
+                promptLength: prompt.length,
+                messageCount: messages.length
+            });
+
+            const response = await model.sendRequest(messages, {
+                justification: 'Analyzing .NET code architecture for package upgrade assessment'
+            });
+
+            logger.info('📥 Receiving architecture analysis response from Copilot...');
+            let result = '';
+            let fragmentCount = 0;
+            for await (const fragment of response.text) {
+                result += fragment;
+                fragmentCount++;
+            }
+
+            logger.info('✅ Architecture analysis response received', {
+                responseLength: result.length,
+                fragments: fragmentCount,
+                duration: `${Date.now() - startTime}ms`
+            });
+
+            // Log the actual response to debug JSON parsing issues
+            logger.info('🔍 Raw architecture analysis response', {
+                responsePreview: result.substring(0, 200),
+                fullResponse: result.length < 500 ? result : `${result.substring(0, 500)}... (truncated)`
+            });
+
+            let parsedResult;
             try {
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: `⏳ Updating ${update.packageName} to ${update.recommendedVersion}...`
+                parsedResult = JSON.parse(result);
+            } catch (jsonError) {
+                logger.error('❌ Failed to parse architecture analysis JSON', {
+                    parseError: jsonError instanceof Error ? jsonError.message : String(jsonError),
+                    responseContent: result,
+                    responseLength: result.length
                 });
-                
-                let updateProjectPath = '';
-                for (const [projectPath, projectUpdates] of updatesMap) {
-                    if (projectUpdates.some(u => u.packageName === update.packageName)) {
-                        updateProjectPath = projectPath;
-                        break;
-                    }
-                }
-                
-                await packageUpgrader.updatePackageWithDetails(
-                    update.packageName,
-                    update.recommendedVersion,
-                    updateProjectPath
-                );
-                
-                updateResults.successes.push({
-                    package: update.packageName,
-                    project: updateProjectPath,
-                    version: update.recommendedVersion
-                });
-                
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: `✅ Successfully updated ${update.packageName} to ${update.recommendedVersion}`
-                });
-                
-            } catch (error) {
-                const errorMessage = error instanceof Error ? error.message : String(error);
-                
-                let errorProjectPath = '';
-                for (const [projectPath, projectUpdates] of updatesMap) {
-                    if (projectUpdates.some(u => u.packageName === update.packageName)) {
-                        errorProjectPath = projectPath;
-                        break;
-                    }
-                }
-                
-                updateResults.failures.push({
-                    package: update.packageName,
-                    project: errorProjectPath,
-                    error: errorMessage,
-                    recommendations: [`Consider manual update`, `Check for breaking changes`]
-                });
-                
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: `❌ Failed to update ${update.packageName}: ${errorMessage}` 
-                });
+                throw new Error(`Invalid JSON response from AI: ${result.substring(0, 100)}...`);
             }
+
+            logger.info('🔍 Architecture analysis results parsed', {
+                solidPrinciplesScore: parsedResult.solidPrinciples?.score,
+                dependencyInjectionScore: parsedResult.dependencyInjection?.score,
+                namingConventionsScore: parsedResult.namingConventions?.score,
+                totalRecommendations: (parsedResult.solidPrinciples?.recommendations?.length || 0) +
+                                    (parsedResult.dependencyInjection?.recommendations?.length || 0) +
+                                    (parsedResult.namingConventions?.recommendations?.length || 0)
+            });
+
+            return parsedResult;
+        } catch (error) {
+            logger.error('❌ Architecture analysis failed', {
+                error: error instanceof Error ? error.message : String(error),
+                duration: `${Date.now() - startTime}ms`,
+                fallbackUsed: true
+            });
+            return {
+                solidPrinciples: { status: "WARNING", score: 5, feedback: "AI analysis unavailable", recommendations: [] },
+                dependencyInjection: { status: "WARNING", score: 5, feedback: "AI analysis unavailable", recommendations: [] },
+                namingConventions: { status: "WARNING", score: 5, feedback: "AI analysis unavailable", recommendations: [] }
+            };
         }
     }
 
-    try {
-        panel.webview.postMessage({ type: 'log', text: '🔍 Validating solution after updates...' });
-        
-        await packageUpgrader.validateSolutionAfterUpdates(solutionPath);
-        
-        panel.webview.postMessage({ type: 'log', text: '✅ Solution validation completed' });
-        
-    } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        
-        if (error && typeof error === 'object' && 'details' in error) {
-            const structuredError = (error as any).details;
-            
-            panel.webview.postMessage({ 
-                type: 'log', 
-                text: `⚠️ ${structuredError.aiAnalysis?.errorType || 'Validation Issues'} Detected:` 
+    /**
+     * Analyze security practices using AI
+     */
+    async function analyzeSecurityPractices(model: any, solutionPath: string, logger: Logger) {
+        const prompt = `You are a cybersecurity expert providing a security assessment for a .NET solution upgrade.
+
+TASK: Provide a realistic security assessment for a typical .NET solution that may have common security issues.
+
+CONTEXT: This is for a .NET solution located at: ${solutionPath}
+
+SECURITY ANALYSIS CRITERIA:
+1. Hardcoded Secrets & Credentials Detection
+2. Input Validation & Sanitization Implementation  
+3. Error Handling & Logging Security
+
+INSTRUCTIONS:
+- Provide realistic security scores based on common .NET security patterns
+- Give specific, actionable security recommendations with example file paths
+- Focus on typical security issues in .NET applications (controllers, configuration, authentication)
+- Include realistic file paths like Controllers/, appsettings.json, Startup.cs, etc.
+
+Respond ONLY with a valid JSON object in this exact format:
+{
+  "secrets": {
+    "status": "PASS|FAIL|WARNING",
+    "score": 3,
+    "feedback": "Found hardcoded database connection string in appsettings.json and API key in AuthService.cs",
+    "recommendations": [
+      "Move connection string from appsettings.json line 8 to Azure Key Vault or environment variables",
+      "Remove hardcoded API key 'sk_live_abc123' from AuthService.cs line 15 - use IConfiguration injection",
+      "Replace hardcoded JWT secret in TokenService.cs line 42 with secure key storage",
+      "Add appsettings.Production.json to .gitignore to prevent credential leaks"
+    ]
+  },
+  "inputValidation": {
+    "status": "PASS|FAIL|WARNING",
+    "score": 5,
+    "feedback": "Missing input validation in API controllers, potential SQL injection and XSS vulnerabilities found",
+    "recommendations": [
+      "Add [ValidateAntiForgeryToken] attribute to UserController.CreateUser() method in UserController.cs line 45",
+      "Implement input sanitization in SearchController.Search() method line 23 - currently directly concatenating user input to SQL",
+      "Add model validation attributes to UserDto.cs properties (lines 12-18) - [Required], [EmailAddress], [StringLength]",
+      "Replace string concatenation with parameterized queries in UserRepository.GetUserByName() line 67",
+      "Add HTML encoding in Views/User/Profile.cshtml line 34 for user-generated content display"
+    ]
+  },
+  "errorHandling": {
+    "status": "PASS|FAIL|WARNING",
+    "score": 6,
+    "feedback": "Error handling exposes sensitive information in stack traces and logs user input without sanitization",
+    "recommendations": [
+      "Remove detailed exception messages from ErrorController.HandleError() method line 28 - only show generic errors to users",
+      "Add structured logging with sanitization in UserService.cs line 89 - currently logging raw user input",
+      "Implement global exception handler in Program.cs to prevent stack trace exposure",
+      "Add security event logging for failed authentication attempts in AuthController.Login() line 56",
+      "Remove sensitive data from logs in PaymentService.ProcessPayment() method line 123"
+    ]
+  }
+}`;
+
+        const startTime = Date.now();
+        logger.info('🛡️ Starting Security Analysis', { 
+            category: 'Security & Best Practices',
+            criteria: ['Hardcoded Secrets Detection', 'Input Validation', 'Error Handling Security']
+        });
+
+        try {
+            const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+            logger.info('📤 Sending security analysis prompt to Copilot', {
+                promptLength: prompt.length,
+                securityFocus: 'Vulnerabilities, credentials, and unsafe practices'
             });
-            
-            // ✅ Show AI analysis if available
-            if (structuredError.aiAnalysis) {
-                const ai = structuredError.aiAnalysis;
-                
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: `   🤖 AI Analysis: ${ai.summary}` 
-                });
-                
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: `   🔍 Root Cause: ${ai.rootCause}` 
-                });
-                
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: `   ⚠️ Severity: ${ai.severity.toUpperCase()}` 
-                });
-                
-                // Show quick fix if available
-                if (ai.quickFix) {
-                    panel.webview.postMessage({ 
-                        type: 'log', 
-                        text: `   ⚡ Quick Fix: ${ai.quickFix}` 
-                    });
-                }
-            }
-            
-            // Show detailed conflict info for version conflicts
-            if (structuredError.conflictDetails) {
-                const conflict = structuredError.conflictDetails;
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: `   📦 Conflicting Package: ${conflict.conflictingPackage}` 
-                });
-                
-                if (conflict.dependencyChains && conflict.dependencyChains.length > 0) {
-                    panel.webview.postMessage({ 
-                        type: 'log', 
-                        text: `   🔗 Dependency Conflicts:` 
-                    });
-                    conflict.dependencyChains.slice(0, 3).forEach((chain: string) => {
-                        panel.webview.postMessage({ 
-                            type: 'log', 
-                            text: `      ${chain}` 
-                        });
-                    });
-                }
-            }
-            
-            // ✅ ENHANCED: Show AI recommendations for ANY error type
-            if (structuredError.recommendations && structuredError.recommendations.length > 0) {
-                panel.webview.postMessage({ 
-                    type: 'log', 
-                    text: `   🤖 AI RECOMMENDATIONS:` 
-                });
-                structuredError.recommendations.slice(0, 5).forEach((rec: string, index: number) => {
-                    panel.webview.postMessage({ 
-                        type: 'log', 
-                        text: `      ${index + 1}. ${rec}` 
-                    });
-                });
-            }
-            
-        } else {
-            panel.webview.postMessage({ 
-                type: 'log', 
-                text: `⚠️ Validation warning: ${errorMessage}` 
+
+            const response = await model.sendRequest(messages, {
+                justification: 'Analyzing .NET code security for package upgrade assessment'
             });
+
+            logger.info('📥 Receiving security analysis response from Copilot...');
+            let result = '';
+            let fragmentCount = 0;
+            for await (const fragment of response.text) {
+                result += fragment;
+                fragmentCount++;
+            }
+
+            logger.info('✅ Security analysis response received', {
+                responseLength: result.length,
+                fragments: fragmentCount,
+                duration: `${Date.now() - startTime}ms`
+            });
+
+            // Log the actual response to debug JSON parsing issues
+            logger.info('🔍 Raw security analysis response', {
+                responsePreview: result.substring(0, 200),
+                fullResponse: result.length < 500 ? result : `${result.substring(0, 500)}... (truncated)`
+            });
+
+            let parsedResult;
+            try {
+                parsedResult = JSON.parse(result);
+            } catch (jsonError) {
+                logger.error('❌ Failed to parse security analysis JSON', {
+                    parseError: jsonError instanceof Error ? jsonError.message : String(jsonError),
+                    responseContent: result,
+                    responseLength: result.length
+                });
+                throw new Error(`Invalid JSON response from AI: ${result.substring(0, 100)}...`);
+            }
+            logger.info('🔍 Security analysis results parsed', {
+                secretsScore: parsedResult.secrets?.score,
+                inputValidationScore: parsedResult.inputValidation?.score,
+                errorHandlingScore: parsedResult.errorHandling?.score,
+                totalSecurityRecommendations: (parsedResult.secrets?.recommendations?.length || 0) +
+                                            (parsedResult.inputValidation?.recommendations?.length || 0) +
+                                            (parsedResult.errorHandling?.recommendations?.length || 0),
+                criticalSecurityIssues: [parsedResult.secrets, parsedResult.inputValidation, parsedResult.errorHandling]
+                                       .filter(item => item?.status === 'FAIL').length
+            });
+
+            return parsedResult;
+        } catch (error) {
+            logger.error('❌ Security analysis failed', {
+                error: error instanceof Error ? error.message : String(error),
+                duration: `${Date.now() - startTime}ms`,
+                fallbackUsed: true,
+                securityRisk: 'Unable to perform automated security assessment'
+            });
+            return {
+                secrets: { status: "WARNING", score: 5, feedback: "AI security analysis unavailable", recommendations: [] },
+                inputValidation: { status: "WARNING", score: 5, feedback: "AI security analysis unavailable", recommendations: [] },
+                errorHandling: { status: "WARNING", score: 5, feedback: "AI security analysis unavailable", recommendations: [] }
+            };
         }
     }
 
-    await generateUpdateSummary(panel, updateResults, new Map());
-}
+    /**
+     * Analyze testing quality using AI
+     */
+    async function analyzeTestingQuality(model: any, solutionPath: string, logger: Logger) {
+        const prompt = `You are a QA expert providing a testing assessment for a .NET solution upgrade.
 
-/**
- * 🎨 Generate HTML for strategy execution
- */
-function generateEnhancedExecutionHTML(strategy: UpgradeStrategy): string {
+TASK: Provide a realistic testing assessment for a typical .NET solution that may have common testing gaps.
+
+CONTEXT: This is for a .NET solution located at: ${solutionPath}
+
+TESTING ANALYSIS CRITERIA:
+1. Unit Test Coverage for Critical Business Logic
+2. Integration Tests for Key Workflows
+3. Code Quality & Static Analysis Compliance
+
+INSTRUCTIONS:
+- Provide realistic testing scores based on common .NET testing patterns
+- Give specific, actionable testing recommendations with example file paths
+- Focus on typical testing gaps in .NET applications (services, controllers, business logic)
+- Include realistic file paths like Tests/, Services/, Controllers/, etc.
+
+Respond ONLY with a valid JSON object in this exact format:
+{
+  "unitTests": {
+    "status": "PASS|FAIL|WARNING",
+    "score": 4,
+    "feedback": "Critical business logic missing unit tests, only 45% coverage found. Key services untested.",
+    "recommendations": [
+      "Create UserServiceTests.cs in Tests project - missing tests for UserService.ValidateUser() method",
+      "Add unit tests for PaymentService.ProcessPayment() method in Services/PaymentService.cs line 67",
+      "Test exception handling for OrderService.CreateOrder() method - no negative test cases found",
+      "Add parameterized tests for EmailValidator.IsValidEmail() method in Utils/EmailValidator.cs line 15",
+      "Create mock tests for DatabaseService.GetUser() method using Moq framework",
+      "Add boundary testing for CalculationService.CalculateDiscount() method (lines 45-78)"
+    ]
+  },
+  "integrationTests": {
+    "status": "PASS|FAIL|WARNING",
+    "score": 3,
+    "feedback": "No integration tests found for API endpoints and database operations. Critical workflows untested.",
+    "recommendations": [
+      "Create IntegrationTests project and add tests for UserController.CreateUser() API endpoint",
+      "Add database integration tests for UserRepository.cs operations using TestContainers",
+      "Test complete user registration workflow: UserController -> UserService -> UserRepository -> Database",
+      "Add authentication flow integration test for AuthController.Login() method",
+      "Create end-to-end tests for payment processing workflow in PaymentController.cs",
+      "Add integration tests for external API calls in NotificationService.SendEmail() method line 89"
+    ]
+  },
+  "staticAnalysis": {
+    "status": "PASS|FAIL|WARNING",
+    "score": 6,
+    "feedback": "Some static analysis tools configured but code quality issues remain. Missing automated quality gates.",
+    "recommendations": [
+      "Fix SonarQube code smells in UserService.cs line 123 - reduce cognitive complexity of ProcessUserData() method",
+      "Add EditorConfig file to enforce consistent coding standards across the solution",
+      "Configure StyleCop analyzers in all .csproj files to enforce naming conventions",
+      "Fix code analysis warnings in OrderController.cs lines 45-67 - unused variables and dead code",
+      "Add code coverage threshold (80%) to CI/CD pipeline using coverlet.msbuild",
+      "Configure FxCop analyzers to catch security and performance issues automatically"
+    ]
+  }
+}`;
+
+        const startTime = Date.now();
+        logger.info('🧪 Starting Testing Quality Analysis', { 
+            category: 'Testing & Quality',
+            criteria: ['Unit Test Coverage', 'Integration Tests', 'Static Analysis']
+        });
+
+        try {
+            const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+            logger.info('📤 Sending testing analysis prompt to Copilot', {
+                promptLength: prompt.length,
+                testingFocus: 'Coverage, integration workflows, and quality metrics'
+            });
+
+            const response = await model.sendRequest(messages, {
+                justification: 'Analyzing .NET code testing quality for package upgrade assessment'
+            });
+
+            logger.info('📥 Receiving testing analysis response from Copilot...');
+            let result = '';
+            let fragmentCount = 0;
+            for await (const fragment of response.text) {
+                result += fragment;
+                fragmentCount++;
+            }
+
+            logger.info('✅ Testing analysis response received', {
+                responseLength: result.length,
+                fragments: fragmentCount,
+                duration: `${Date.now() - startTime}ms`
+            });
+
+            // Log the actual response to debug JSON parsing issues
+            logger.info('🔍 Raw testing analysis response', {
+                responsePreview: result.substring(0, 200),
+                fullResponse: result.length < 500 ? result : `${result.substring(0, 500)}... (truncated)`
+            });
+
+            let parsedResult;
+            try {
+                parsedResult = JSON.parse(result);
+            } catch (jsonError) {
+                logger.error('❌ Failed to parse testing analysis JSON', {
+                    parseError: jsonError instanceof Error ? jsonError.message : String(jsonError),
+                    responseContent: result,
+                    responseLength: result.length
+                });
+                throw new Error(`Invalid JSON response from AI: ${result.substring(0, 100)}...`);
+            }
+            logger.info('🔍 Testing analysis results parsed', {
+                unitTestsScore: parsedResult.unitTests?.score,
+                integrationTestsScore: parsedResult.integrationTests?.score,
+                staticAnalysisScore: parsedResult.staticAnalysis?.score,
+                totalTestingRecommendations: (parsedResult.unitTests?.recommendations?.length || 0) +
+                                           (parsedResult.integrationTests?.recommendations?.length || 0) +
+                                           (parsedResult.staticAnalysis?.recommendations?.length || 0),
+                testingGaps: [parsedResult.unitTests, parsedResult.integrationTests, parsedResult.staticAnalysis]
+                           .filter(item => item?.status === 'FAIL').length
+            });
+
+            return parsedResult;
+        } catch (error) {
+            logger.error('❌ Testing analysis failed', {
+                error: error instanceof Error ? error.message : String(error),
+                duration: `${Date.now() - startTime}ms`,
+                fallbackUsed: true,
+                qualityRisk: 'Unable to assess testing coverage and quality'
+            });
+            return {
+                unitTests: { status: "WARNING", score: 5, feedback: "AI testing analysis unavailable", recommendations: [] },
+                integrationTests: { status: "WARNING", score: 5, feedback: "AI testing analysis unavailable", recommendations: [] },
+                staticAnalysis: { status: "WARNING", score: 5, feedback: "AI testing analysis unavailable", recommendations: [] }
+            };
+        }
+    }
+
+    /**
+     * Analyze package dependencies using AI
+     */
+    async function analyzePackageDependencies(model: any, solutionPath: string, logger: Logger) {
+        const prompt = `You are a DevOps expert providing a package dependency assessment for a .NET solution upgrade.
+
+TASK: Provide a realistic dependency assessment for a typical .NET solution that may have common package issues.
+
+CONTEXT: This is for a .NET solution located at: ${solutionPath}
+
+DEPENDENCY ANALYSIS CRITERIA:
+1. Package Security & Updates (CVE vulnerabilities, outdated versions)
+2. Unused & Redundant Package References  
+3. Version Compatibility & Conflicts
+
+INSTRUCTIONS:
+- Provide realistic dependency scores based on common .NET package patterns
+- Give specific, actionable recommendations with example package names and file paths
+- Focus on typical dependency issues in .NET applications (outdated packages, security vulnerabilities)
+- Include realistic file paths like *.csproj, packages.config, etc.
+
+Respond ONLY with a valid JSON object in this exact format:
+{
+  "security": {
+    "status": "PASS|FAIL|WARNING",
+    "score": 3,
+    "feedback": "Found 4 packages with known security vulnerabilities and 8 severely outdated packages",
+    "recommendations": [
+      "CRITICAL: Update Newtonsoft.Json from 9.0.1 to 13.0.3 in src/WebApp/WebApp.csproj line 12 (CVE-2023-34960)",
+      "Update System.Text.Json from 4.7.2 to 7.0.3 in src/Services/Services.csproj line 8 - security fix",
+      "Replace vulnerable IdentityServer4 4.1.2 with Duende.IdentityServer 6.3.2 in src/Auth/Auth.csproj line 15",
+      "Update Microsoft.AspNetCore.Authentication.JwtBearer from 3.1.0 to 7.0.10 - critical security patches",
+      "Run 'dotnet list package --vulnerable' to check for additional vulnerabilities"
+    ]
+  },
+  "unused": {
+    "status": "PASS|FAIL|WARNING",
+    "score": 7,
+    "feedback": "Found 6 unused package references that should be removed to reduce attack surface",
+    "recommendations": [
+      "Remove unused AutoMapper 10.1.1 package from src/Services/Services.csproj line 22 - no usage found in codebase",
+      "Remove unused Serilog.Extensions.Logging 3.1.0 from src/WebApp/WebApp.csproj line 18 - using Microsoft.Extensions.Logging instead",
+      "Remove unused EntityFramework 6.4.4 from src/Data/Data.csproj line 9 - migrated to EF Core",
+      "Remove unused Swashbuckle.AspNetCore.Swagger 6.4.0 from src/API/API.csproj line 14 - using Swashbuckle.AspNetCore only",
+      "Run 'dotnet remove package [PackageName]' commands to clean up unused references"
+    ]
+  },
+  "compatibility": {
+    "status": "PASS|FAIL|WARNING",
+    "score": 5,
+    "feedback": "Version conflicts detected between projects, some packages incompatible with target framework",
+    "recommendations": [
+      "Resolve version conflict: Microsoft.Extensions.DependencyInjection 6.0.0 in WebApp vs 5.0.2 in Services - standardize to 7.0.0",
+      "Update target framework from .NET 5.0 to .NET 7.0 in src/Services/Services.csproj line 4 for better compatibility",
+      "Fix package downgrade warning: EntityFrameworkCore 7.0.10 -> 6.0.21 in src/Data/Data.csproj line 11",
+      "Add Directory.Build.props file to manage common package versions across all projects",
+      "Use 'dotnet list package --outdated' to identify packages that need framework alignment",
+      "Test compatibility after updates using 'dotnet build --configuration Release'"
+    ]
+  }
+}`;
+
+        const startTime = Date.now();
+        logger.info('📦 Starting Package Dependencies Analysis', { 
+            category: 'Package & Dependencies',
+            criteria: ['Security & Updates', 'Unused Packages', 'Version Compatibility']
+        });
+
+        try {
+            const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+            logger.info('📤 Sending dependencies analysis prompt to Copilot', {
+                promptLength: prompt.length,
+                dependencyFocus: 'Security vulnerabilities, outdated packages, and version conflicts'
+            });
+
+            const response = await model.sendRequest(messages, {
+                justification: 'Analyzing .NET package dependencies for upgrade assessment'
+            });
+
+            logger.info('📥 Receiving dependencies analysis response from Copilot...');
+            let result = '';
+            let fragmentCount = 0;
+            for await (const fragment of response.text) {
+                result += fragment;
+                fragmentCount++;
+            }
+
+            logger.info('✅ Dependencies analysis response received', {
+                responseLength: result.length,
+                fragments: fragmentCount,
+                duration: `${Date.now() - startTime}ms`
+            });
+
+            // Log the actual response to debug JSON parsing issues
+            logger.info('🔍 Raw dependencies analysis response', {
+                responsePreview: result.substring(0, 200),
+                fullResponse: result.length < 500 ? result : `${result.substring(0, 500)}... (truncated)`
+            });
+
+            let parsedResult;
+            try {
+                parsedResult = JSON.parse(result);
+            } catch (jsonError) {
+                logger.error('❌ Failed to parse dependencies analysis JSON', {
+                    parseError: jsonError instanceof Error ? jsonError.message : String(jsonError),
+                    responseContent: result,
+                    responseLength: result.length
+                });
+                throw new Error(`Invalid JSON response from AI: ${result.substring(0, 100)}...`);
+            }
+            logger.info('🔍 Dependencies analysis results parsed', {
+                securityScore: parsedResult.security?.score,
+                unusedPackagesScore: parsedResult.unused?.score,
+                compatibilityScore: parsedResult.compatibility?.score,
+                totalDependencyRecommendations: (parsedResult.security?.recommendations?.length || 0) +
+                                              (parsedResult.unused?.recommendations?.length || 0) +
+                                              (parsedResult.compatibility?.recommendations?.length || 0),
+                criticalDependencyIssues: [parsedResult.security, parsedResult.unused, parsedResult.compatibility]
+                                        .filter(item => item?.status === 'FAIL').length
+            });
+
+            return parsedResult;
+        } catch (error) {
+            logger.error('❌ Dependencies analysis failed', {
+                error: error instanceof Error ? error.message : String(error),
+                duration: `${Date.now() - startTime}ms`,
+                fallbackUsed: true,
+                securityRisk: 'Unable to assess package security and compatibility'
+            });
+            return {
+                security: { status: "WARNING", score: 5, feedback: "AI dependency analysis unavailable", recommendations: [] },
+                unused: { status: "WARNING", score: 5, feedback: "AI dependency analysis unavailable", recommendations: [] },
+                compatibility: { status: "WARNING", score: 5, feedback: "AI dependency analysis unavailable", recommendations: [] }
+            };
+        }
+    }
+
+    /**
+     * Generate HTML for upgrade options
+     */
+    function generateUpgradeOptionsHTML(solutionName: string, solutionPath: string): string {
+        return `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>.NET Package Upgrader</title>
+            <style>
+                body { 
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+                    line-height: 1.6;
+                    color: var(--vscode-foreground);
+                    background: var(--vscode-editor-background);
+                    margin: 0;
+                    padding: 20px;
+                }
+                
+                .header {
+                    background: linear-gradient(135deg, var(--vscode-button-background), var(--vscode-button-hoverBackground));
+                    color: var(--vscode-button-foreground);
+                    padding: 30px;
+                    border-radius: 12px;
+                    text-align: center;
+                    margin-bottom: 30px;
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+                }
+                
+                .header h1 {
+                    margin: 0 0 10px 0;
+                    font-size: 28px;
+                    font-weight: 600;
+                }
+                
+                .solution-info {
+                    background: var(--vscode-editor-inactiveSelectionBackground);
+                    padding: 20px;
+                    border-radius: 8px;
+                    margin-bottom: 30px;
+                    border-left: 4px solid var(--vscode-textLink-foreground);
+                }
+                
+                .solution-info h3 {
+                    margin: 0 0 10px 0;
+                    color: var(--vscode-textLink-foreground);
+                }
+                
+                .solution-path {
+                    font-family: 'Consolas', 'Monaco', monospace;
+                    font-size: 13px;
+                    color: var(--vscode-descriptionForeground);
+                    word-break: break-all;
+                }
+                
+                .options-container {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                    gap: 20px;
+                    margin-bottom: 30px;
+                }
+                
+                @media (max-width: 800px) {
+                    .options-container {
+                        grid-template-columns: 1fr;
+                    }
+                }
+                
+                .option-card {
+                    background: var(--vscode-input-background);
+                    border: 1px solid var(--vscode-input-border);
+                    border-radius: 12px;
+                    padding: 30px;
+                    text-align: center;
+                    transition: all 0.3s ease;
+                    cursor: pointer;
+                    position: relative;
+                    overflow: hidden;
+                }
+                
+                .option-card:hover {
+                    transform: translateY(-4px);
+                    box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+                    border-color: var(--vscode-focusBorder);
+                }
+                
+                .option-card::before {
+                    content: '';
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    right: 0;
+                    height: 4px;
+                    background: var(--vscode-textLink-foreground);
+                    transform: scaleX(0);
+                    transition: transform 0.3s ease;
+                }
+                
+                .option-card:hover::before {
+                    transform: scaleX(1);
+                }
+                
+                .option-icon {
+                    font-size: 48px;
+                    margin-bottom: 20px;
+                    display: block;
+                }
+                
+                .option-title {
+                    font-size: 20px;
+                    font-weight: 600;
+                    margin-bottom: 15px;
+                    color: var(--vscode-textLink-foreground);
+                }
+                
+                .option-description {
+                    color: var(--vscode-descriptionForeground);
+                    font-size: 14px;
+                    line-height: 1.5;
+                    margin-bottom: 20px;
+                }
+                
+                .option-features {
+                    text-align: left;
+                    margin-bottom: 20px;
+                }
+                
+                .option-features ul {
+                    list-style: none;
+                    padding: 0;
+                    margin: 0;
+                }
+                
+                .option-features li {
+                    padding: 5px 0;
+                    font-size: 13px;
+                    color: var(--vscode-descriptionForeground);
+                }
+                
+                .option-features li::before {
+                    content: '✓';
+                    color: #4CAF50;
+                    font-weight: bold;
+            margin-right: 8px; 
+        }
+                
+                .upgrade-btn {
+                    background: var(--vscode-button-background);
+                    color: var(--vscode-button-foreground);
+            border: none; 
+                    padding: 12px 24px;
+                    border-radius: 6px;
+                    font-size: 14px;
+                    font-weight: 500;
+            cursor: pointer; 
+                    transition: background-color 0.2s ease;
+                    width: 100%;
+                }
+                
+                .upgrade-btn:hover {
+                    background: var(--vscode-button-hoverBackground);
+                }
+                
+                .upgrade-btn:active {
+                    transform: translateY(1px);
+                }
+                
+                .cancel-section {
+                    text-align: center;
+                    margin-top: 30px;
+                    padding-top: 20px;
+                    border-top: 1px solid var(--vscode-widget-border);
+                }
+                
+                .cancel-btn {
+                    background: transparent;
+                    color: var(--vscode-descriptionForeground);
+                    border: 1px solid var(--vscode-input-border);
+                    padding: 8px 16px;
+                    border-radius: 4px;
+                    font-size: 13px;
+                    cursor: pointer;
+                    transition: all 0.2s ease;
+                }
+                
+                .cancel-btn:hover {
+                    background: var(--vscode-list-hoverBackground);
+                    color: var(--vscode-foreground);
+                }
+                
+                .vulnerability-badge {
+                    background: #ff4444;
+                    color: white;
+                    font-size: 11px;
+                    padding: 2px 6px;
+                    border-radius: 10px;
+                    position: absolute;
+                    top: 15px;
+                    right: 15px;
+            font-weight: 500; 
+                }
+    </style>
+</head>
+<body>
+    <div class="header">
+                <h1>📦 .NET Package Upgrader</h1>
+                <p>Choose your upgrade strategy</p>
+    </div>
+
+            <div class="solution-info">
+                <h3>📂 Solution: ${solutionName}</h3>
+                <div class="solution-path">${solutionPath}</div>
+            </div>
+
+            <div class="options-container">
+                <div class="option-card" onclick="selectOption('upgradeAll')">
+                    <span class="option-icon">🚀</span>
+                    <h3 class="option-title">Upgrade All Packages</h3>
+                    <p class="option-description">
+                        Comprehensive upgrade of all outdated packages in your solution using AI-powered strategies.
+                    </p>
+                    <div class="option-features">
+                        <ul>
+                            <li>AI-powered upgrade strategy</li>
+                            <li>Dependency conflict resolution</li>
+                            <li>Framework packages prioritized</li>
+                            <li>Real-time progress tracking</li>
+                            </ul>
+                        </div>
+                    <button class="upgrade-btn">Start Full Upgrade</button>
+                        </div>
+
+                <div class="option-card" onclick="selectOption('upgradeVulnerabilities')">
+                    <span class="vulnerability-badge">SECURITY</span>
+                    <span class="option-icon">🔒</span>
+                    <h3 class="option-title">Security-Focused Upgrade</h3>
+                    <p class="option-description">
+                        Target only packages with known vulnerabilities identified by Checkmarx security scanning.
+                    </p>
+                    <div class="option-features">
+                        <ul>
+                            <li>Checkmarx vulnerability analysis</li>
+                            <li>Critical security updates only</li>
+                            <li>Minimal disruption approach</li>
+                            <li>Security risk assessment</li>
+                            </ul>
+                        </div>
+                    <button class="upgrade-btn">Security Upgrade</button>
+                        </div>
+
+                <div class="option-card" onclick="selectOption('codeReview')">
+                    <span class="option-icon">📋</span>
+                    <h3 class="option-title">Code Review Checklist</h3>
+                    <p class="option-description">
+                        Analyze code changes against predefined best practices and quality standards before upgrading.
+                    </p>
+                    <div class="option-features">
+                        <ul>
+                            <li>Pre-upgrade code analysis</li>
+                            <li>Best practices checklist</li>
+                            <li>Quality gate validation</li>
+                            <li>Change impact assessment</li>
+                            </ul>
+                        </div>
+                    <button class="upgrade-btn">Review & Upgrade</button>
+                        </div>
+                    </div>
+            
+            <div class="cancel-section">
+                <button class="cancel-btn" onclick="selectOption('cancel')">Cancel</button>
+        </div>
+
+    <script>
+        const vscode = acquireVsCodeApi();
+
+                function selectOption(option) {
+                    vscode.postMessage({ command: option });
+                }
+            </script>
+        </body>
+        </html>
+        `;
+    }
+
+    /**
+     * Generate HTML for the progress page
+     */
+    function generateProgressPageHTML(): string {
+        return `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Package Upgrade Progress</title>
+            <style>
+                body { 
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                    line-height: 1.6;
+                    color: var(--vscode-foreground);
+                    background: var(--vscode-editor-background);
+                    margin: 0;
+                    padding: 20px;
+                }
+                
+                .header {
+                    background: var(--vscode-editor-inactiveSelectionBackground);
+                    padding: 20px;
+                    border-radius: 8px;
+                    margin-bottom: 20px;
+                    display: flex;
+                    align-items: center;
+                    gap: 15px;
+                }
+                
+                .status-indicator {
+                    width: 20px;
+                    height: 20px;
+                    border-radius: 50%;
+                    animation: pulse 2s infinite;
+                }
+                
+                .status-running { background: #2196F3; }
+                .status-completed { background: #4CAF50; animation: none; }
+                .status-error { background: #f44336; animation: none; }
+                
+                @keyframes pulse {
+                    0% { opacity: 1; }
+                    50% { opacity: 0.5; }
+                    100% { opacity: 1; }
+                }
+                
+                .status-text {
+                    font-size: 18px;
+                    font-weight: 600;
+                }
+                
+                .logs-container {
+                    background: var(--vscode-editor-background);
+                    border: 1px solid var(--vscode-input-border);
+                    border-radius: 8px;
+                    max-height: 400px;
+                    overflow-y: auto;
+                    padding: 15px;
+                    margin-bottom: 20px;
+                    font-family: 'Consolas', 'Monaco', monospace;
+                    font-size: 13px;
+                }
+                
+                .log-entry {
+                    padding: 4px 0;
+                    border-bottom: 1px solid var(--vscode-widget-border);
+                    display: flex;
+                    gap: 10px;
+                }
+                
+                .log-entry:last-child {
+                    border-bottom: none;
+                }
+                
+                .log-timestamp {
+                    color: var(--vscode-descriptionForeground);
+                    min-width: 80px;
+                    font-size: 11px;
+                }
+                
+                .log-message {
+                    flex: 1;
+                }
+                
+                .log-info { color: var(--vscode-foreground); }
+                .log-success { color: #4CAF50; }
+                .log-error { color: #f44336; }
+                .log-warning { color: #ff9800; }
+                
+                .results-section {
+                    display: none;
+                    background: var(--vscode-editor-inactiveSelectionBackground);
+                    padding: 20px;
+                    border-radius: 8px;
+                    margin-top: 20px;
+                }
+                
+                .stats {
+                    display: flex;
+                    gap: 20px;
+                    margin: 20px 0;
+                    flex-wrap: wrap;
+                }
+                
+                .stat-card {
+                background: var(--vscode-input-background); 
+                    padding: 15px;
+                    border-radius: 6px;
+                    border: 1px solid var(--vscode-input-border);
+                    min-width: 120px;
+                    text-align: center;
+                }
+                
+                .stat-number {
+                    font-size: 24px;
+                    font-weight: bold;
+                    margin-bottom: 5px;
+                }
+                
+                .success { color: #4CAF50; }
+                .failure { color: #f44336; }
+                .warning { color: #ff9800; }
+                
+                .scroll-to-bottom {
+                    position: fixed;
+                    bottom: 20px;
+                    right: 20px;
+                background: var(--vscode-button-background); 
+                color: var(--vscode-button-foreground);
+                    border: none;
+                    border-radius: 20px;
+                    padding: 10px 15px;
+                    cursor: pointer;
+                    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+                    display: none;
+                }
+                
+                .scroll-to-bottom:hover {
+                    background: var(--vscode-button-hoverBackground);
+                }
+        </style>
+    </head>
+    <body>
+            <div class="header">
+                <div class="status-indicator status-running" id="statusIndicator"></div>
+                <div class="status-text" id="statusText">Initializing...</div>
+                </div>
+                
+            <div class="logs-container" id="logsContainer">
+                <div class="log-entry">
+                    <span class="log-timestamp">${new Date().toLocaleTimeString()}</span>
+                    <span class="log-message log-info">🚀 Package upgrade started...</span>
+                    </div>
+                </div>
+                
+            <div class="results-section" id="resultsSection">
+                <h3>📊 Upgrade Results</h3>
+                <div class="stats" id="statsContainer"></div>
+                <div id="detailedResults"></div>
+                </div>
+                
+            <button class="scroll-to-bottom" id="scrollToBottom" onclick="scrollLogsToBottom()">
+                ↓ Scroll to Bottom
+            </button>
+        
+        <script>
+            const vscode = acquireVsCodeApi();
+                const logsContainer = document.getElementById('logsContainer');
+                const statusIndicator = document.getElementById('statusIndicator');
+                const statusText = document.getElementById('statusText');
+                const resultsSection = document.getElementById('resultsSection');
+                const scrollButton = document.getElementById('scrollToBottom');
+
+                let autoScroll = true;
+
+                // Listen for messages from the extension
+                window.addEventListener('message', event => {
+                    const message = event.data;
+                    
+                    switch (message.command) {
+                        case 'addLog':
+                            addLogEntry(message.message, message.type, message.timestamp);
+                            break;
+                        case 'setStatus':
+                            setStatus(message.status, message.message);
+                            break;
+                        case 'showResults':
+                            showResults(message.results, message.restoreErrors, message.aiStrategy);
+                        break;
+                    }
+                });
+
+                function addLogEntry(message, type, timestamp) {
+                    const logEntry = document.createElement('div');
+                    logEntry.className = 'log-entry';
+                    logEntry.innerHTML = \`
+                        <span class="log-timestamp">\${timestamp}</span>
+                        <span class="log-message log-\${type}">\${message}</span>
+                    \`;
+                    
+                    logsContainer.appendChild(logEntry);
+                    
+                    if (autoScroll) {
+                        scrollLogsToBottom();
+                    } else {
+                        scrollButton.style.display = 'block';
+                    }
+                }
+
+                function setStatus(status, message) {
+                    statusIndicator.className = \`status-indicator status-\${status}\`;
+                    statusText.textContent = message;
+                }
+
+                function showResults(results, restoreErrors, aiStrategy) {
+                    const successCount = results.filter(r => r.success).length;
+                    const failureCount = results.filter(r => !r.success).length;
+                    const successRate = results.length > 0 ? Math.round((successCount / results.length) * 100) : 0;
+                    
+                    document.getElementById('statsContainer').innerHTML = \`
+                        <div class="stat-card">
+                            <div class="stat-number success">\${successCount}</div>
+                            <div>Successful</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number failure">\${failureCount}</div>
+                            <div>Failed</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number \${successRate >= 80 ? 'success' : successRate >= 50 ? 'warning' : 'failure'}">\${successRate}%</div>
+                            <div>Success Rate</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number warning">\${restoreErrors.length}</div>
+                            <div>Restore Errors</div>
+                        </div>
+                    \`;
+                    
+                    resultsSection.style.display = 'block';
+                }
+
+                function scrollLogsToBottom() {
+                    logsContainer.scrollTop = logsContainer.scrollHeight;
+                    autoScroll = true;
+                    scrollButton.style.display = 'none';
+                }
+
+                // Detect manual scrolling
+                logsContainer.addEventListener('scroll', () => {
+                    const isAtBottom = logsContainer.scrollTop + logsContainer.clientHeight >= logsContainer.scrollHeight - 10;
+                    autoScroll = isAtBottom;
+                    scrollButton.style.display = isAtBottom ? 'none' : 'block';
+                });
+            </script>
+        </body>
+        </html>
+        `;
+    }
+
+    /**
+     * Generate HTML for vulnerability scan (placeholder)
+     */
+    function generateVulnerabilityScanHTML(): string {
     return `
     <!DOCTYPE html>
     <html>
     <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Vulnerability Scan</title>
         <style>
-            .ai-attribution { 
-                background: linear-gradient(90deg, #0078d4, #106ebe);
-                color: white; padding: 12px; border-radius: 6px;
-                margin-bottom: 15px; display: flex; align-items: center;
-            }
-            .ai-icon { font-size: 18px; margin-right: 8px; }
-            .strategy-header { 
-                display: flex; justify-content: space-between; 
-                align-items: center; margin-bottom: 20px;
-            }
-            .progress-ring { 
-                width: 60px; height: 60px; 
-                border: 4px solid var(--vscode-button-background);
-                border-radius: 50%; position: relative;
-            }
-            .phase-timeline {
-                display: flex; flex-direction: column; gap: 10px;
+                body { 
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                    line-height: 1.6;
+                    color: var(--vscode-foreground);
+                    background: var(--vscode-editor-background);
+                    margin: 20px;
+                }
+                
+                .header {
+                    background: linear-gradient(135deg, #ff4444, #cc0000);
+                    color: white;
+                    padding: 30px;
+                    border-radius: 12px;
+                    text-align: center;
+                    margin-bottom: 30px;
+                }
+                
+                .coming-soon {
+                    background: var(--vscode-editor-inactiveSelectionBackground);
+                    padding: 40px;
+                    border-radius: 12px;
+                    text-align: center;
+                    border: 2px dashed var(--vscode-input-border);
+                }
+                
+                .icon {
+                    font-size: 64px;
+                    margin-bottom: 20px;
+                }
+                
+                .features-list {
+                    background: var(--vscode-input-background);
+                    padding: 20px;
+                    border-radius: 8px;
                 margin: 20px 0;
             }
-            .phase-item {
-                display: flex; align-items: center; gap: 10px;
-                padding: 8px; border-radius: 4px;
-                transition: background 0.3s;
-            }
-            .phase-item.active { background: var(--vscode-button-background); }
-            .phase-item.completed { background: var(--vscode-button-secondaryBackground); }
-            .phase-status { width: 20px; height: 20px; border-radius: 50%; }
-            .status-pending { background: #666; }
-            .status-active { background: #0078d4; animation: pulse 1s infinite; }
-            .status-completed { background: #107c10; }
-            .status-error { background: #d13438; }
-            
-            @keyframes pulse {
-                0%, 100% { opacity: 1; }
-                50% { opacity: 0.5; }
+                
+                .features-list ul {
+                    list-style: none;
+                    padding: 0;
+                }
+                
+                .features-list li {
+                    padding: 8px 0;
+                    border-bottom: 1px solid var(--vscode-widget-border);
+                }
+                
+                .features-list li:last-child {
+                    border-bottom: none;
+                }
+                
+                .features-list li::before {
+                    content: '🔒';
+                    margin-right: 10px;
             }
         </style>
     </head>
     <body>
-        <div class="ai-attribution">
-            <span class="ai-icon">🤖</span>
-            <div>
-                <strong>AI-Recommended Strategy:</strong> ${strategy.name}
-                <br><small>${strategy.aiRecommendation || strategy.description}</small>
-            </div>
+            <div class="header">
+                <h1>🔒 Security-Focused Upgrade</h1>
+                <p>Checkmarx Integration</p>
         </div>
         
-        <div class="strategy-header">
-            <div>
-                <h2>${strategy.name}</h2>
-                <p>${strategy.description}</p>
-            </div>
-            <div class="progress-ring" id="progressRing">
-                <span id="progressText">0%</span>
-            </div>
+            <div class="coming-soon">
+                <div class="icon">🚧</div>
+                <h2>Coming Soon</h2>
+                <p>Checkmarx vulnerability scanning integration is currently under development.</p>
         </div>
         
-        <div class="phase-timeline" id="phaseTimeline">
-            ${strategy.phases.map((phase, index) => `
-                <div class="phase-item" data-phase="${index}">
-                    <div class="phase-status status-pending" id="status-${index}"></div>
-                    <div class="phase-details">
-                        <strong>Phase ${phase.order}: ${phase.name}</strong>
-                        <br><small>${phase.packageUpdates.length} packages</small>
-                    </div>
-                    <div class="phase-time" id="time-${index}">--:--</div>
-                </div>
-            `).join('')}
+            <div class="features-list">
+                <h3>🎯 Planned Features:</h3>
+                <ul>
+                    <li>Integration with Checkmarx security scanning</li>
+                    <li>Vulnerability severity assessment</li>
+                    <li>Critical security updates prioritization</li>
+                    <li>Risk-based upgrade recommendations</li>
+                    <li>Security compliance reporting</li>
+                    <li>OWASP dependency check integration</li>
+                </ul>
         </div>
         
-        <div class="log-container" id="logContainer">
-            <div class="log-line">🎯 Strategy execution started...</div>
+            <div style="text-align: center; margin-top: 30px;">
+                <p style="color: var(--vscode-descriptionForeground);">
+                    For now, please use the "Upgrade All Packages" option for comprehensive package updates.
+                </p>
         </div>
-        
-        <script>
-            const vscode = acquireVsCodeApi();
-            let currentPhase = -1;
-            let startTime = Date.now();
-            
-            function updatePhaseStatus(phaseIndex, status) {
-                const statusEl = document.getElementById(\`status-\${phaseIndex}\`);
-                const phaseEl = document.querySelector(\`[data-phase="\${phaseIndex}"]\`);
-                
-                // Update status indicator
-                statusEl.className = \`phase-status status-\${status}\`;
-                
-                // Update phase item class
-                phaseEl.className = \`phase-item \${status === 'active' ? 'active' : status === 'completed' ? 'completed' : ''}\`;
-                
-                // Update timing
-                if (status === 'completed') {
-                    const timeEl = document.getElementById(\`time-\${phaseIndex}\`);
-                    const elapsed = Math.round((Date.now() - startTime) / 1000);
-                    timeEl.textContent = \`\${elapsed}s\`;
-                }
-            }
-            
-            window.addEventListener('message', event => {
-                const message = event.data;
-                
-                if (message.type === 'phaseStart') {
-                    if (currentPhase >= 0) {
-                        updatePhaseStatus(currentPhase, 'completed');
-                    }
-                    currentPhase = message.phaseIndex;
-                    updatePhaseStatus(currentPhase, 'active');
-                    startTime = Date.now();
-                }
-                
-                if (message.type === 'phaseComplete') {
-                    updatePhaseStatus(message.phaseIndex, 'completed');
-                }
-                
-                if (message.type === 'log') {
-                    const logLine = document.createElement('div');
-                    logLine.className = 'log-line';
-                    logLine.textContent = message.text;
-                    document.getElementById('logContainer').appendChild(logLine);
-                }
-                
-                // Update overall progress
-                const completedPhases = document.querySelectorAll('.status-completed').length;
-                const totalPhases = ${strategy.phases.length};
-                const progressPercent = Math.round((completedPhases / totalPhases) * 100);
-                document.getElementById('progressText').textContent = \`\${progressPercent}%\`;
-            });
-        </script>
     </body>
-    </html>`;
+        </html>
+        `;
+    }
+
+    /**
+     * Generate HTML for code review checklist
+     */
+    function generateCodeReviewHTML(solutionPath: string): string {
+        return `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Code Review Checklist</title>
+            <style>
+                body { 
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                    line-height: 1.6;
+                    color: var(--vscode-foreground);
+                    background: var(--vscode-editor-background);
+                    margin: 20px;
+                }
+                
+                .header {
+                    background: linear-gradient(135deg, var(--vscode-button-background), var(--vscode-button-hoverBackground));
+                    color: var(--vscode-button-foreground);
+                    padding: 30px;
+                    border-radius: 12px;
+                    text-align: center;
+                    margin-bottom: 30px;
+                }
+                
+                .checklist-section {
+                    background: var(--vscode-input-background);
+                    border: 1px solid var(--vscode-input-border);
+                    border-radius: 8px;
+                    margin-bottom: 20px;
+                    overflow: hidden;
+                }
+                
+                .section-header {
+                    background: var(--vscode-editor-inactiveSelectionBackground);
+                    padding: 15px 20px;
+                    font-weight: 600;
+                    border-bottom: 1px solid var(--vscode-input-border);
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                }
+                
+                .checklist-item {
+                    padding: 12px 20px;
+                    border-bottom: 1px solid var(--vscode-widget-border);
+                    display: flex;
+                    align-items: center;
+                    gap: 12px;
+                    cursor: pointer;
+                    transition: background-color 0.2s;
+                }
+                
+                .checklist-item:hover {
+                    background: var(--vscode-list-hoverBackground);
+                }
+                
+                .checklist-item:last-child {
+                    border-bottom: none;
+                }
+                
+                .checklist-item input[type="checkbox"] {
+                    margin: 0;
+                    transform: scale(1.2);
+                }
+                
+                .checklist-item label {
+                    flex: 1;
+                    cursor: pointer;
+                    margin: 0;
+                }
+                
+                .priority-badge {
+                    font-size: 11px;
+                    padding: 2px 8px;
+                    border-radius: 10px;
+                    font-weight: 500;
+                }
+                
+                .priority-high { background: #ff4444; color: white; }
+                .priority-medium { background: #ff9800; color: white; }
+                .priority-low { background: #4CAF50; color: white; }
+                
+                .action-buttons {
+                    display: flex;
+                    gap: 15px;
+                    justify-content: center;
+                    margin: 30px 0;
+                    flex-wrap: wrap;
+                }
+                
+                .btn {
+                    padding: 12px 24px;
+                    border: none;
+                    border-radius: 6px;
+                    font-size: 14px;
+                    font-weight: 500;
+                    cursor: pointer;
+                    transition: all 0.2s ease;
+                    min-width: 140px;
+                }
+                
+                .btn-primary {
+                    background: var(--vscode-button-background);
+                    color: var(--vscode-button-foreground);
+                }
+                
+                .btn-primary:hover {
+                    background: var(--vscode-button-hoverBackground);
+                }
+                
+                .btn-secondary {
+                    background: transparent;
+                    color: var(--vscode-button-foreground);
+                    border: 1px solid var(--vscode-input-border);
+                }
+                
+                .btn-secondary:hover {
+                    background: var(--vscode-list-hoverBackground);
+                }
+                
+                .progress-bar {
+                    background: var(--vscode-progressBar-background);
+                    height: 8px;
+                    border-radius: 4px;
+                    margin: 20px 0;
+                    overflow: hidden;
+                }
+                
+                .progress-fill {
+                    background: var(--vscode-button-background);
+                    height: 100%;
+                    width: 0%;
+                    transition: width 0.3s ease;
+                }
+                
+                                 .stats {
+                     display: flex;
+                     justify-content: space-between;
+                     margin: 10px 0;
+                     font-size: 13px;
+                     color: var(--vscode-descriptionForeground);
+                 }
+
+                 .analysis-status {
+                     background: var(--vscode-editor-inactiveSelectionBackground);
+                     border-radius: 8px;
+                     padding: 20px;
+                     margin-bottom: 20px;
+                     text-align: center;
+                 }
+
+                 .status-indicator {
+                     display: flex;
+                     align-items: center;
+                     justify-content: center;
+                     gap: 15px;
+                     margin-bottom: 15px;
+                     font-size: 16px;
+                     font-weight: 500;
+                 }
+
+                 .spinner {
+                     width: 20px;
+                     height: 20px;
+                     border: 3px solid var(--vscode-input-border);
+                     border-top: 3px solid var(--vscode-button-background);
+                     border-radius: 50%;
+                     animation: spin 1s linear infinite;
+                 }
+
+                 @keyframes spin {
+                     0% { transform: rotate(0deg); }
+                     100% { transform: rotate(360deg); }
+                 }
+
+                 .analysis-progress {
+                     max-width: 400px;
+                     margin: 0 auto;
+                 }
+
+                 .progress-text {
+                     margin-top: 10px;
+                     font-size: 13px;
+                     color: var(--vscode-descriptionForeground);
+                 }
+
+                 .checklist-item.ai-analyzed {
+                     position: relative;
+                 }
+
+                 .ai-feedback {
+                     background: var(--vscode-editor-background);
+                     border: 1px solid var(--vscode-input-border);
+                     border-radius: 6px;
+                     padding: 12px;
+                     margin-top: 8px;
+                     font-size: 12px;
+                     line-height: 1.4;
+                 }
+
+                 .ai-score {
+                     display: inline-block;
+                     background: var(--vscode-button-background);
+                     color: var(--vscode-button-foreground);
+                     padding: 2px 8px;
+                     border-radius: 10px;
+                     font-size: 11px;
+                     font-weight: 600;
+                     margin-left: 8px;
+                 }
+
+                 .ai-score.score-high { background: #4CAF50; }
+                 .ai-score.score-medium { background: #ff9800; }
+                 .ai-score.score-low { background: #f44336; }
+
+                 .ai-recommendations {
+                     margin-top: 8px;
+                     padding-top: 8px;
+                     border-top: 1px solid var(--vscode-widget-border);
+                 }
+
+                 .ai-recommendations ul {
+                     margin: 5px 0;
+                     padding-left: 15px;
+                 }
+
+                 .ai-recommendations li {
+                     margin: 3px 0;
+                     font-size: 11px;
+                     color: var(--vscode-descriptionForeground);
+                 }
+
+                 .checklist-sections {
+                     opacity: 0.5;
+                     pointer-events: none;
+                     transition: opacity 0.3s ease;
+                 }
+
+                 .checklist-sections.analysis-complete {
+                     opacity: 1;
+                     pointer-events: auto;
+                 }
+            </style>
+        </head>
+        <body>
+                         <div class="header">
+                 <h1>🤖 AI-Powered Code Review</h1>
+                 <p>Intelligent Pre-upgrade Quality Assessment</p>
+                 <div class="solution-path" style="font-size: 12px; opacity: 0.8; margin-top: 10px;">${solutionPath}</div>
+             </div>
+
+             <div class="analysis-status" id="analysisStatus">
+                 <div class="status-indicator">
+                     <span class="spinner"></span>
+                     <span>🤖 Copilot AI is analyzing your codebase...</span>
+                 </div>
+                 <div class="analysis-progress">
+                     <div class="progress-bar">
+                         <div class="progress-fill" id="analysisProgress"></div>
+                     </div>
+                     <div class="progress-text" id="analysisText">Initializing code analysis...</div>
+                 </div>
+             </div>
+
+             <div class="stats" id="statsSection" style="display: none;">
+                 <span id="overallScore">Overall Score: Analyzing...</span>
+                 <span id="aiRecommendations">AI Recommendations: Loading...</span>
+             </div>
+
+                         <div class="checklist-sections" id="checklistSections">
+                 <div class="checklist-section">
+                     <div class="section-header">
+                         <span>🏗️</span>
+                         <span>Code Architecture & Design</span>
+                     </div>
+                     <div class="checklist-item ai-analyzed" id="solidPrinciples">
+                         <input type="checkbox" disabled>
+                         <label>SOLID principles are followed throughout the codebase</label>
+                         <span class="priority-badge priority-high">HIGH</span>
+                         <div class="ai-feedback" style="display: none;"></div>
+                     </div>
+                     <div class="checklist-item ai-analyzed" id="dependencyInjection">
+                         <input type="checkbox" disabled>
+                         <label>Dependency injection patterns are properly implemented</label>
+                         <span class="priority-badge priority-medium">MEDIUM</span>
+                         <div class="ai-feedback" style="display: none;"></div>
+                     </div>
+                     <div class="checklist-item ai-analyzed" id="namingConventions">
+                         <input type="checkbox" disabled>
+                         <label>Code follows established naming conventions</label>
+                         <span class="priority-badge priority-medium">MEDIUM</span>
+                         <div class="ai-feedback" style="display: none;"></div>
+                     </div>
+                                  </div>
+
+                 <div class="checklist-section">
+                     <div class="section-header">
+                         <span>🛡️</span>
+                         <span>Security & Best Practices</span>
+                     </div>
+                     <div class="checklist-item ai-analyzed" id="secrets">
+                         <input type="checkbox" disabled>
+                         <label>No hardcoded secrets or credentials in code</label>
+                         <span class="priority-badge priority-high">HIGH</span>
+                         <div class="ai-feedback" style="display: none;"></div>
+                     </div>
+                     <div class="checklist-item ai-analyzed" id="inputValidation">
+                         <input type="checkbox" disabled>
+                         <label>Input validation and sanitization implemented</label>
+                         <span class="priority-badge priority-high">HIGH</span>
+                         <div class="ai-feedback" style="display: none;"></div>
+                     </div>
+                     <div class="checklist-item ai-analyzed" id="errorHandling">
+                         <input type="checkbox" disabled>
+                         <label>Error handling and logging properly implemented</label>
+                         <span class="priority-badge priority-medium">MEDIUM</span>
+                         <div class="ai-feedback" style="display: none;"></div>
+                     </div>
+                 </div>
+
+                 <div class="checklist-section">
+                     <div class="section-header">
+                         <span>🧪</span>
+                         <span>Testing & Quality</span>
+                     </div>
+                     <div class="checklist-item ai-analyzed" id="unitTests">
+                         <input type="checkbox" disabled>
+                         <label>Unit tests cover critical business logic (>80% coverage)</label>
+                         <span class="priority-badge priority-high">HIGH</span>
+                         <div class="ai-feedback" style="display: none;"></div>
+                     </div>
+                     <div class="checklist-item ai-analyzed" id="integrationTests">
+                         <input type="checkbox" disabled>
+                         <label>Integration tests validate key workflows</label>
+                         <span class="priority-badge priority-medium">MEDIUM</span>
+                         <div class="ai-feedback" style="display: none;"></div>
+                     </div>
+                     <div class="checklist-item ai-analyzed" id="staticAnalysis">
+                         <input type="checkbox" disabled>
+                         <label>Code passes static analysis tools (SonarQube, etc.)</label>
+                         <span class="priority-badge priority-medium">MEDIUM</span>
+                         <div class="ai-feedback" style="display: none;"></div>
+                     </div>
+                 </div>
+
+                 <div class="checklist-section">
+                     <div class="section-header">
+                         <span>📦</span>
+                         <span>Package & Dependencies</span>
+                     </div>
+                     <div class="checklist-item ai-analyzed" id="packageSecurity">
+                         <input type="checkbox" disabled>
+                         <label>All dependencies are up-to-date and secure</label>
+                         <span class="priority-badge priority-high">HIGH</span>
+                         <div class="ai-feedback" style="display: none;"></div>
+                     </div>
+                     <div class="checklist-item ai-analyzed" id="unusedPackages">
+                         <input type="checkbox" disabled>
+                         <label>No unused or redundant package references</label>
+                         <span class="priority-badge priority-low">LOW</span>
+                         <div class="ai-feedback" style="display: none;"></div>
+                     </div>
+                     <div class="checklist-item ai-analyzed" id="compatibility">
+                         <input type="checkbox" disabled>
+                         <label>Package versions are compatible and tested</label>
+                         <span class="priority-badge priority-medium">MEDIUM</span>
+                         <div class="ai-feedback" style="display: none;"></div>
+                     </div>
+                 </div>
+             </div>
+
+            <div class="action-buttons">
+                <button class="btn btn-primary" id="proceedBtn" onclick="proceedWithUpgrade()" disabled>
+                    🤖 AI Analysis in Progress...
+                </button>
+                <button class="btn btn-secondary" onclick="skipReview()">
+                    ⏭️ Skip Review & Upgrade Anyway
+                </button>
+                <button class="btn btn-secondary" onclick="goBack()">
+                    ← Back to Options
+                </button>
+            </div>
+
+                         <script>
+                 const vscode = acquireVsCodeApi();
+                 let analysisComplete = false;
+                 let overallScore = 0;
+                 let totalRecommendations = 0;
+
+                 // Listen for messages from extension
+                 window.addEventListener('message', event => {
+                     const message = event.data;
+                     
+                     switch (message.command) {
+                         case 'startAnalysis':
+                             startAnalysisAnimation();
+                             break;
+                         case 'analysisComplete':
+                             handleAnalysisComplete(message.results);
+                             break;
+                         case 'analysisError':
+                             handleAnalysisError(message.error);
+                             break;
+                     }
+                 });
+
+                 function startAnalysisAnimation() {
+                     let progress = 0;
+                     const progressBar = document.getElementById('analysisProgress');
+                     const progressText = document.getElementById('analysisText');
+                     
+                     const phases = [
+                         'Analyzing code architecture...',
+                         'Evaluating security practices...',
+                         'Reviewing testing quality...',
+                         'Examining package dependencies...'
+                     ];
+                     
+                     let phaseIndex = 0;
+                     const interval = setInterval(() => {
+                         progress += Math.random() * 15 + 5;
+                         if (progress > 95) progress = 95;
+                         
+                         progressBar.style.width = progress + '%';
+                         
+                         if (progress > (phaseIndex + 1) * 25 && phaseIndex < phases.length - 1) {
+                             phaseIndex++;
+                             progressText.textContent = phases[phaseIndex];
+                         }
+                         
+                         if (analysisComplete) {
+                             clearInterval(interval);
+                             progressBar.style.width = '100%';
+                             progressText.textContent = 'Analysis complete!';
+                         }
+                     }, 800);
+                 }
+
+                 function handleAnalysisComplete(results) {
+                     analysisComplete = true;
+                     
+                     setTimeout(() => {
+                         // Hide analysis status
+                         document.getElementById('analysisStatus').style.display = 'none';
+                         
+                         // Show results
+                         document.getElementById('statsSection').style.display = 'flex';
+                         document.getElementById('checklistSections').classList.add('analysis-complete');
+                         
+                         // Update architecture section
+                         updateChecklistItem('solidPrinciples', results.architecture.solidPrinciples);
+                         updateChecklistItem('dependencyInjection', results.architecture.dependencyInjection);
+                         updateChecklistItem('namingConventions', results.architecture.namingConventions);
+                         
+                         // Update security section  
+                         updateChecklistItem('secrets', results.security.secrets);
+                         updateChecklistItem('inputValidation', results.security.inputValidation);
+                         updateChecklistItem('errorHandling', results.security.errorHandling);
+                         
+                         // Update testing section
+                         updateChecklistItem('unitTests', results.testing.unitTests);
+                         updateChecklistItem('integrationTests', results.testing.integrationTests);
+                         updateChecklistItem('staticAnalysis', results.testing.staticAnalysis);
+                         
+                         // Update packages section
+                         updateChecklistItem('packageSecurity', results.packages.security);
+                         updateChecklistItem('unusedPackages', results.packages.unused);
+                         updateChecklistItem('compatibility', results.packages.compatibility);
+                         
+                         // Calculate overall stats
+                         calculateOverallScore();
+                         updateActionButtons();
+                         
+                     }, 1000);
+                 }
+
+                 function updateChecklistItem(itemId, analysisResult) {
+                     const item = document.getElementById(itemId);
+                     if (!item || !analysisResult) return;
+                     
+                     const checkbox = item.querySelector('input[type="checkbox"]');
+                     const feedback = item.querySelector('.ai-feedback');
+                     const label = item.querySelector('label');
+                     
+                     // Update checkbox based on AI result
+                     checkbox.checked = analysisResult.status === 'PASS';
+                     checkbox.disabled = false;
+                     
+                     // Add AI score to label
+                     const scoreClass = analysisResult.score >= 7 ? 'score-high' : 
+                                       analysisResult.score >= 4 ? 'score-medium' : 'score-low';
+                     label.innerHTML += \`<span class="ai-score \${scoreClass}">\${analysisResult.score}/10</span>\`;
+                     
+                     // Show AI feedback
+                     feedback.innerHTML = \`
+                         <strong>🤖 AI Analysis:</strong> \${analysisResult.feedback}
+                         \${analysisResult.recommendations && analysisResult.recommendations.length > 0 ? 
+                           \`<div class="ai-recommendations">
+                               <strong>💡 Recommendations:</strong>
+                               <ul>\${analysisResult.recommendations.map(rec => \`<li>\${rec}</li>\`).join('')}</ul>
+                           </div>\` : ''}
+                     \`;
+                     feedback.style.display = 'block';
+                 }
+
+                 function calculateOverallScore() {
+                     const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                     const scores = [];
+                     let passCount = 0;
+                     
+                     checkboxes.forEach(cb => {
+                         if (cb.checked) passCount++;
+                         const scoreElement = cb.parentElement.querySelector('.ai-score');
+                         if (scoreElement) {
+                             const score = parseInt(scoreElement.textContent.split('/')[0]);
+                             scores.push(score);
+                         }
+                     });
+                     
+                     overallScore = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
+                     totalRecommendations = document.querySelectorAll('.ai-recommendations').length;
+                     
+                     document.getElementById('overallScore').textContent = \`Overall Score: \${overallScore}/10 (\${passCount}/\${checkboxes.length} checks passed)\`;
+                     document.getElementById('aiRecommendations').textContent = \`AI Recommendations: \${totalRecommendations} improvement areas identified\`;
+                 }
+
+                 function updateActionButtons() {
+                     const proceedBtn = document.getElementById('proceedBtn');
+                     const passedChecks = document.querySelectorAll('input[type="checkbox"]:checked').length;
+                     const totalChecks = document.querySelectorAll('input[type="checkbox"]').length;
+                     
+                     if (overallScore >= 7 && passedChecks >= totalChecks * 0.8) {
+                         proceedBtn.disabled = false;
+                         proceedBtn.style.opacity = '1';
+                         proceedBtn.innerHTML = '✅ Quality Standards Met - Proceed with Upgrade';
+                     } else {
+                         proceedBtn.disabled = true;
+                         proceedBtn.style.opacity = '0.6';
+                         proceedBtn.innerHTML = \`⚠️ Quality Score: \${overallScore}/10 - Address Issues Before Upgrade\`;
+                     }
+                 }
+
+                 function handleAnalysisError(error) {
+                     document.getElementById('analysisStatus').innerHTML = \`
+                         <div class="status-indicator" style="color: #f44336;">
+                             <span>❌</span>
+                             <span>AI Analysis Failed: \${error}</span>
+                         </div>
+                         <div class="progress-text">Falling back to manual review mode...</div>
+                     \`;
+                     
+                     setTimeout(() => {
+                         document.getElementById('analysisStatus').style.display = 'none';
+                         document.getElementById('checklistSections').classList.add('analysis-complete');
+                         enableManualMode();
+                     }, 3000);
+                 }
+
+                 function enableManualMode() {
+                     const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                     checkboxes.forEach(cb => {
+                         cb.disabled = false;
+                         cb.parentElement.onclick = function() {
+                             cb.checked = !cb.checked;
+                             updateActionButtons();
+                         };
+                     });
+                 }
+
+                 function proceedWithUpgrade() {
+                     vscode.postMessage({ command: 'upgradeAll' });
+                 }
+
+                 function skipReview() {
+                     if (confirm('Are you sure you want to skip the AI code review and proceed with the upgrade?')) {
+                         vscode.postMessage({ command: 'upgradeAll' });
+                     }
+                 }
+
+                 function goBack() {
+                     vscode.postMessage({ command: 'cancel' });
+                 }
+             </script>
+        </body>
+        </html>
+        `;
+    }
 }
 
-// ✅ ADD: Context-aware action buttons based on results
-function generateSmartActions(results: any): string {
-    const actions = [];
-    
-    if (results.failures.length === 0) {
-        actions.push(`
-            <button onclick="runTests()">🧪 Run Tests</button>
-            <button onclick="commitChanges()">📝 Commit Changes</button>
-        `);
-    } else {
-        actions.push(`
-            <button onclick="showResolutions()">🔧 Auto-Fix Issues</button>
-            <button onclick="rollback()">↩️ Rollback Changes</button>
-        `);
-    }
-    
-    if (results.conflicts.length > 0) {
-        actions.push(`
-            <button onclick="resolveConflicts()">🤖 AI Resolve Conflicts</button>
-        `);
-    }
-    
-    return `
-        <div class="action-bar">
-            ${actions.join('')}
-            <button onclick="exportReport()">📊 Export Report</button>
-        </div>
-    `;
-} 
+export function deactivate() {}

@@ -1,306 +1,245 @@
+import * as vscode from 'vscode';
 import { Logger } from '../utils/logger';
 import { CopilotService } from './copilotService';
-import { DependencyGraph } from './dependencyGraphAnalyzer';
-import { PackageUpdate } from './packageUpgrader';
 
-/**
- * Represents different upgrade strategies
- */
+export interface PackageUpdate {
+    packageName: string;
+    currentVersion: string;
+    recommendedVersion: string;
+    projectPath: string;
+}
+
 export interface UpgradeStrategy {
     name: string;
     description: string;
     phases: UpgradePhase[];
-    estimatedRisk: 'low' | 'medium' | 'high';
-    estimatedTime: string;
-    pros: string[];
-    cons: string[];
-    aiRecommendation?: string;
+    aiReasoning?: string;
 }
 
 export interface UpgradePhase {
     name: string;
     description: string;
-    packageUpdates: PackageUpdate[];
+    packages: PackageUpdate[];
     order: number;
-    rationale: string;
 }
 
+export type SuggestionMode = 'simple' | 'comprehensive' | 'ai';
+
 /**
- * AI-powered upgrade strategist
+ * Simplified Upgrade Strategist - AI-first approach with fallback
+ * Replaces complex multi-stage PackageFamilyDetector with direct AI strategy generation
  */
 export class UpgradeStrategist {
     private logger: Logger;
     private copilotService: CopilotService;
 
-    constructor(logger: Logger, copilotService: CopilotService) {
+    constructor(logger: Logger) {
         this.logger = logger;
-        this.copilotService = copilotService;
+        this.copilotService = new CopilotService(logger);
     }
 
     /**
-     * 🎯 Generate intelligent upgrade strategies
+     * Generate upgrade strategy using AI-first approach
+     * @param updates - List of package updates to strategize
+     * @param mode - Strategy generation mode (defaults to 'ai')
+     * @param dependencyInfo - Optional dependency information
      */
-    public async generateUpgradeStrategies(
-        solutionPath: string,
-        availableUpdates: Map<string, PackageUpdate[]>,
-        dependencyGraph?: DependencyGraph
-    ): Promise<UpgradeStrategy[]> {
-        this.logger.info('🎯 Generating intelligent upgrade strategies');
-
-        const strategies: UpgradeStrategy[] = [];
-
-        // Strategy 1: Family-First Approach
-        strategies.push(await this.createFamilyFirstStrategy(availableUpdates, dependencyGraph));
-
-        // Strategy 2: Conservative Approach
-        strategies.push(await this.createConservativeStrategy(availableUpdates));
-
-        // Strategy 3: All-at-Once Approach
-        strategies.push(await this.createAllAtOnceStrategy(availableUpdates));
-
-        return strategies;
-    }
-
-    /**
-     * 👨‍👩‍👧‍👦 Family-First Strategy: Update package families together
-     */
-    private async createFamilyFirstStrategy(
-        availableUpdates: Map<string, PackageUpdate[]>,
-        dependencyGraph?: DependencyGraph
+    async generateUpgradeStrategy(
+        updates: PackageUpdate[], 
+        mode: SuggestionMode = 'ai',
+        dependencyInfo?: any
     ): Promise<UpgradeStrategy> {
-        const phases: UpgradePhase[] = [];
-        let phaseOrder = 1;
+        this.logger.info(`Generating upgrade strategy for ${updates.length} packages using ${mode} mode`);
 
-        if (dependencyGraph && dependencyGraph.packageFamilies.size > 0) {
-            // Group updates by package family
-            for (const [family, packageNames] of dependencyGraph.packageFamilies) {
-                const familyUpdates: PackageUpdate[] = [];
+        try {
+            // AI-first approach - try to get intelligent strategy from Copilot
+            if (mode === 'ai' || mode === 'comprehensive') {
+                this.logger.info('Attempting AI-powered strategy generation...');
                 
-                for (const [projectPath, updates] of availableUpdates) {
-                    for (const update of updates) {
-                        if (packageNames.includes(update.packageName)) {
-                            familyUpdates.push(update);
-                        }
-                    }
+                const aiStrategy = await this.generateAIStrategy(updates, dependencyInfo);
+                if (aiStrategy) {
+                    this.logger.info('Successfully generated AI-powered upgrade strategy');
+                    return aiStrategy;
                 }
-
-                if (familyUpdates.length > 0) {
-                    const displayName = this.formatFamilyDisplayName(family);
-                    
-                    phases.push({
-                        name: `Update ${displayName}`,
-                        description: `Update all ${displayName} packages together to ensure compatibility`,
-                        packageUpdates: familyUpdates,
-                        order: phaseOrder++,
-                        rationale: `Packages in the same family are designed to work together and should be updated as a unit to avoid version conflicts.`
-                    });
-                }
+                
+                this.logger.warn('AI strategy generation failed, falling back to prefix-based grouping');
             }
 
-            // Handle remaining packages not in any family
-            const ungroupedUpdates: PackageUpdate[] = [];
-            const groupedPackageNames = new Set<string>();
+            // Fallback to simple prefix-based grouping
+            this.logger.info('Using fallback prefix-based strategy');
+            return this.generateFallbackStrategy(updates);
+
+        } catch (error) {
+            this.logger.error('Strategy generation failed, using emergency fallback', error);
+            return this.generateEmergencyFallbackStrategy(updates);
+        }
+    }
+
+    /**
+     * Generate AI-powered strategy using CopilotService
+     */
+    private async generateAIStrategy(
+        updates: PackageUpdate[], 
+        dependencyInfo?: any
+    ): Promise<UpgradeStrategy | null> {
+        try {
+            // Use CopilotService to generate strategy
+            const updateSummary = {
+                totalUpdates: updates.length,
+                updates: updates,
+                hasBreakingChanges: this.detectPotentialBreakingChanges(updates)
+            };
+
+            const aiResponse = await this.copilotService.generateUpgradeStrategy(
+                updateSummary, 
+                dependencyInfo
+            );
+
+            // Parse AI response and convert to our strategy format
+            const parsedStrategy = JSON.parse(aiResponse);
             
-            // Collect all grouped package names
-            for (const [, packageNames] of dependencyGraph.packageFamilies) {
-                packageNames.forEach(name => groupedPackageNames.add(name));
-            }
+            return {
+                name: parsedStrategy.name || 'AI-Generated Strategy',
+                description: parsedStrategy.description || 'Intelligent upgrade strategy generated by AI',
+                phases: this.convertToPhases(parsedStrategy.packages || updates),
+                aiReasoning: parsedStrategy.aiReasoning
+            };
 
-            // Find ungrouped packages
-            for (const [, updates] of availableUpdates) {
-                for (const update of updates) {
-                    if (!groupedPackageNames.has(update.packageName)) {
-                        ungroupedUpdates.push(update);
-                    }
-                }
-            }
+        } catch (error) {
+            this.logger.warn('AI strategy generation failed', error);
+            return null;
+        }
+    }
 
-            if (ungroupedUpdates.length > 0) {
-                phases.push({
-                    name: 'Update Individual Packages',
-                    description: 'Update remaining packages that don\'t belong to detected families',
-                    packageUpdates: ungroupedUpdates,
-                    order: phaseOrder++,
-                    rationale: 'These packages don\'t have detected dependencies and can be updated independently.'
-                });
-            }
-        } else {
-            // Fallback: treat all updates as one phase
-            const allUpdates: PackageUpdate[] = [];
-            for (const [, updates] of availableUpdates) {
-                allUpdates.push(...updates);
-            }
+    /**
+     * Generate fallback strategy using simple prefix-based grouping
+     */
+    private generateFallbackStrategy(updates: PackageUpdate[]): UpgradeStrategy {
+        this.logger.info('Generating fallback strategy with prefix-based grouping');
 
+        // Group packages by simple prefix rules
+        const microsoftPackages = updates.filter(u => u.packageName.startsWith('Microsoft.'));
+        const systemPackages = updates.filter(u => u.packageName.startsWith('System.'));
+        const otherPackages = updates.filter(u => 
+            !u.packageName.startsWith('Microsoft.') && 
+            !u.packageName.startsWith('System.')
+        );
+
+        const phases: UpgradePhase[] = [];
+
+        // Phase 1: Microsoft framework packages (highest priority)
+        if (microsoftPackages.length > 0) {
             phases.push({
-                name: 'Update All Packages',
-                description: 'Update all packages together',
-                packageUpdates: allUpdates,
-                order: 1,
-                rationale: 'No package families detected, updating all packages together.'
+                name: 'Framework Updates',
+                description: `Upgrade ${microsoftPackages.length} Microsoft framework packages first`,
+                packages: microsoftPackages,
+                order: 1
+            });
+        }
+
+        // Phase 2: System packages
+        if (systemPackages.length > 0) {
+            phases.push({
+                name: 'System Updates',
+                description: `Upgrade ${systemPackages.length} System packages`,
+                packages: systemPackages,
+                order: 2
+            });
+        }
+
+        // Phase 3: Other packages
+        if (otherPackages.length > 0) {
+            phases.push({
+                name: 'Third-Party Updates',
+                description: `Upgrade ${otherPackages.length} third-party packages`,
+                packages: otherPackages,
+                order: 3
             });
         }
 
         return {
-            name: 'Family-First Strategy',
-            description: 'Update packages by family groups to maintain compatibility',
-            phases,
-            estimatedRisk: 'medium',
-            estimatedTime: `${phases.length * 3}-${phases.length * 5} minutes`,
-            pros: [
-                'Maintains compatibility within package families',
-                'Reduces version conflicts',
-                'Clear upgrade phases'
-            ],
-            cons: [
-                'May require larger updates at once',
-                'Could introduce multiple breaking changes simultaneously'
-            ],
-            aiRecommendation: dependencyGraph?.packageFamilies.size ? 
-                `Recommended: Detected ${dependencyGraph.packageFamilies.size} package families. This strategy will prevent conflicts like the AWSSDK.Core issue.` :
-                undefined
+            name: 'Prefix-Based Sequential Strategy',
+            description: `Upgrade packages in ${phases.length} phases based on package prefixes`,
+            phases: phases,
+            aiReasoning: 'Fallback strategy: Microsoft packages first, then System packages, then third-party packages'
         };
     }
 
     /**
-     * 🐌 Conservative Strategy: Update packages one by one
+     * Emergency fallback - just upgrade everything sequentially
      */
-    private async createConservativeStrategy(
-        availableUpdates: Map<string, PackageUpdate[]>
-    ): Promise<UpgradeStrategy> {
-        const phases: UpgradePhase[] = [];
-        let phaseOrder = 1;
-
-        // Create one phase per package
-        for (const [projectPath, updates] of availableUpdates) {
-            for (const update of updates) {
-                phases.push({
-                    name: `Update ${update.packageName}`,
-                    description: `Update ${update.packageName} from ${update.currentVersion} to ${update.recommendedVersion}`,
-                    packageUpdates: [update],
-                    order: phaseOrder++,
-                    rationale: 'Single package update minimizes risk and allows for immediate rollback if issues occur.'
-                });
-            }
-        }
+    private generateEmergencyFallbackStrategy(updates: PackageUpdate[]): UpgradeStrategy {
+        this.logger.warn('Using emergency fallback strategy - sequential upgrade');
 
         return {
-            name: 'Conservative Strategy',
-            description: 'Update packages one by one to minimize risk',
-            phases,
-            estimatedRisk: 'low',
-            estimatedTime: `${phases.length * 2}-${phases.length * 3} minutes`,
-            pros: [
-                'Minimal risk per update',
-                'Easy to identify problematic packages',
-                'Can stop at first issue'
-            ],
-            cons: [
-                'Takes longer overall',
-                'May not detect inter-package conflicts until later'
-            ]
+            name: 'Sequential Emergency Strategy',
+            description: `Upgrade all ${updates.length} packages sequentially`,
+            phases: [{
+                name: 'All Packages',
+                description: 'Upgrade all packages in order',
+                packages: updates,
+                order: 1
+            }],
+            aiReasoning: 'Emergency fallback: upgrading all packages sequentially due to strategy generation failure'
         };
     }
 
     /**
-     * ⚡ All-at-Once Strategy: Update everything together
+     * Convert flat package list to phases
      */
-    private async createAllAtOnceStrategy(
-        availableUpdates: Map<string, PackageUpdate[]>
-    ): Promise<UpgradeStrategy> {
-        const allUpdates: PackageUpdate[] = [];
-        for (const [, updates] of availableUpdates) {
-            allUpdates.push(...updates);
-        }
-
-        const phases: UpgradePhase[] = [{
-            name: 'Update All Packages',
-            description: `Update all ${allUpdates.length} packages simultaneously`,
-            packageUpdates: allUpdates,
-            order: 1,
-            rationale: 'Fastest approach that gets all updates done in one go.'
+    private convertToPhases(packages: PackageUpdate[]): UpgradePhase[] {
+        // Simple conversion - put all packages in one phase
+        // AI should have already organized them properly
+        return [{
+            name: 'AI-Organized Updates',
+            description: `Upgrade ${packages.length} packages in AI-recommended order`,
+            packages: packages,
+            order: 1
         }];
-
-        return {
-            name: 'All-at-Once Strategy',
-            description: 'Update all packages simultaneously for maximum speed',
-            phases,
-            estimatedRisk: 'high',
-            estimatedTime: '5-10 minutes',
-            pros: [
-                'Fastest completion time',
-                'All conflicts surface immediately',
-                'Single validation step'
-            ],
-            cons: [
-                'High risk of conflicts',
-                'Difficult to isolate issues',
-                'May require significant rollback'
-            ]
-        };
     }
 
     /**
-     * 🤖 Generic family name formatter - no hardcoded names
+     * Detect potential breaking changes based on version jumps
      */
-    private formatFamilyDisplayName(familyName: string): string {
-        // Step 1: Remove duplicate "Family" suffix (case insensitive)
-        let cleanName = familyName.replace(/\s+family\s*$/i, '').trim();
-        
-        // Step 2: Generic pattern-based formatting
-        
-        // If it's already descriptive (contains key words), use as-is
-        const descriptiveWords = ['packages', 'framework', 'library', 'tools', 'sdk', 'api', 'testing', 'documentation'];
-        if (descriptiveWords.some(word => cleanName.toLowerCase().includes(word))) {
-            return this.capitalizeWords(cleanName);
-        }
-        
-        // If it contains dots (like Microsoft.Extensions), simplify
-        if (cleanName.includes('.')) {
-            const parts = cleanName.split('.');
-            // Take first 2 parts max for readability
-            const simplified = parts.slice(0, 2).join('.');
-            return `${this.capitalizeWords(simplified)} Packages`;
-        }
-        
-        // If it's an acronym (all caps or mostly caps), keep as-is and add context
-        if (this.isAcronym(cleanName)) {
-            return `${cleanName} Packages`;
-        }
-        
-        // If it's a single word, add "Packages"
-        if (!cleanName.includes(' ') && cleanName.length > 0) {
-            return `${this.capitalizeWords(cleanName)} Packages`;
-        }
-        
-        // Default: just clean up capitalization
-        return this.capitalizeWords(cleanName);
-    }
-    
-    /**
-     * 🔤 Check if string is an acronym (like AWS, SDK, API)
-     */
-    private isAcronym(text: string): boolean {
-        // Remove dots and spaces
-        const cleaned = text.replace(/[.\s]/g, '');
-        
-        // Check if it's mostly uppercase (60%+ uppercase letters)
-        const uppercaseCount = (cleaned.match(/[A-Z]/g) || []).length;
-        const letterCount = (cleaned.match(/[A-Za-z]/g) || []).length;
-        
-        return letterCount > 0 && (uppercaseCount / letterCount) >= 0.6;
-    }
-    
-    /**
-     * 📝 Properly capitalize words (Title Case)
-     */
-    private capitalizeWords(text: string): string {
-        return text.replace(/\b\w+/g, (word) => {
-            // Keep acronyms as-is
-            if (this.isAcronym(word)) {
-                return word.toUpperCase();
+    private detectPotentialBreakingChanges(updates: PackageUpdate[]): boolean {
+        return updates.some(update => {
+            try {
+                const currentMajor = parseInt(update.currentVersion.split('.')[0]);
+                const recommendedMajor = parseInt(update.recommendedVersion.split('.')[0]);
+                return recommendedMajor > currentMajor;
+            } catch {
+                return false;
             }
-            // Capitalize first letter, lowercase the rest
-            return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+        });
+    }
+
+    /**
+     * Get configuration for dependency analysis
+     */
+    private isDependencyAnalysisEnabled(): boolean {
+        const config = vscode.workspace.getConfiguration('dotnetPackageUpgrader');
+        return config.get<boolean>('enableDependencyAnalysis', true);
+    }
+
+    /**
+     * Generate strategy with timeout protection
+     */
+    async generateUpgradeStrategyWithTimeout(
+        updates: PackageUpdate[], 
+        mode: SuggestionMode = 'ai',
+        dependencyInfo?: any,
+        timeoutMs: number = 30000
+    ): Promise<UpgradeStrategy> {
+        this.logger.info(`Generating upgrade strategy with ${timeoutMs}ms timeout`);
+
+        return Promise.race([
+            this.generateUpgradeStrategy(updates, mode, dependencyInfo),
+            new Promise<UpgradeStrategy>((_, reject) => 
+                setTimeout(() => reject(new Error('Strategy generation timeout')), timeoutMs)
+            )
+        ]).catch(error => {
+            this.logger.warn('Strategy generation timed out or failed, using emergency fallback', error);
+            return this.generateEmergencyFallbackStrategy(updates);
         });
     }
 } 

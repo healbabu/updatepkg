@@ -19,7 +19,13 @@
     "commands": [
       {
         "command": "dotnet-package-upgrader.upgradePackages",
-        "title": "Upgrade .NET Packages"
+        "title": "Upgrade .NET Packages (Advanced)",
+        "category": ".NET Package Upgrader"
+      },
+      {
+        "command": "dotnet-package-upgrader.simpleUpgradePackages",
+        "title": "Upgrade .NET Packages (Simple)",
+        "category": ".NET Package Upgrader"
       }
     ],
     "configuration": {
@@ -81,6 +87,16 @@
           },
           "default": [],
           "description": "Security requirements for package upgrades"
+        },
+        "dotnetPackageUpgrader.enableDependencyAnalysis": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable comprehensive dependency graph analysis (disable to use simplified strategy generation)"
+        },
+        "dotnetPackageUpgrader.suppressFileSystemMonitoring": {
+          "type": "boolean",
+          "default": true,
+          "description": "Suppress file system monitoring during package updates to prevent race conditions with temporary files"
         }
       }
     },
