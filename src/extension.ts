@@ -1,9 +1,11 @@
 import * as vscode from 'vscode';
 import { Logger } from './utils/logger';
 import { PackageUpgrader } from './services/packageUpgrader';
+import { SimplePackageUpgrader } from './services/simplePackageUpgrader';
 import { ConfigurationManager } from './services/configurationManager';
 import * as path from 'path';
 import * as fs from 'fs';
+import { exec } from 'child_process';
 
 /**
  * Extension activation event handler
@@ -145,8 +147,8 @@ export async function activate(context: vscode.ExtensionContext) {
         panel.title = 'Package Upgrade Progress';
         panel.webview.html = generateProgressPageHTML();
 
-        // Start the upgrade process
-        const packageUpgrader = new PackageUpgrader(logger);
+        // Start the upgrade process with enhanced restore error analysis
+        const packageUpgrader = new SimplePackageUpgrader(logger);
         
         // Set up progress callback
         packageUpgrader.onProgress = (message: string, type: 'info' | 'success' | 'error' | 'warning' = 'info') => {
@@ -158,6 +160,18 @@ export async function activate(context: vscode.ExtensionContext) {
             });
         };
 
+        // Handle messages from the webview for restore error fixes
+        panel.webview.onDidReceiveMessage(async (message) => {
+            switch (message.command) {
+                case 'applyRestoreErrorFix':
+                    await handleApplyRestoreErrorFix(panel, solutionPath, message.actionItem, logger);
+                    break;
+                case 'analyzeRestoreErrors':
+                    await handleAnalyzeRestoreErrors(panel, solutionPath, message.restoreErrors, logger);
+                    break;
+            }
+        });
+
         try {
             // Send initial message
                 panel.webview.postMessage({ 
@@ -166,7 +180,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 message: 'Starting package upgrade process...'
                 });
 
-            const { results, restoreErrors, strategy, summary } = await packageUpgrader.upgradePackages(solutionPath);
+            const { results, restoreErrors, restoreErrorAnalysis, aiStrategy } = await packageUpgrader.upgradePackages(solutionPath);
 
             // Send completion message
                 panel.webview.postMessage({ 
@@ -175,13 +189,14 @@ export async function activate(context: vscode.ExtensionContext) {
                 message: 'Package upgrade completed!'
                 });
             
-            // Send final results
+            // Send final results with enhanced restore error analysis
                 panel.webview.postMessage({ 
                 command: 'showResults',
                 results,
                 restoreErrors,
-                strategy,
-                summary
+                restoreErrorAnalysis,
+                strategy: aiStrategy,
+                summary: `${results.filter(r => r.success).length} packages upgraded successfully, ${restoreErrors.length} restore errors`
             });
 
         } catch (error) {
@@ -193,6 +208,130 @@ export async function activate(context: vscode.ExtensionContext) {
                 });
             }
         }
+
+    /**
+     * Handle applying AI-recommended restore error fixes
+     */
+    async function handleApplyRestoreErrorFix(panel: vscode.WebviewPanel, solutionPath: string, actionItem: string, logger: Logger) {
+        try {
+            panel.webview.postMessage({
+                command: 'updateFixStatus',
+                status: 'applying',
+                message: 'Applying AI-recommended fix...'
+            });
+
+            // Parse the action item to determine what fix to apply
+            const fixResult = await applyRestoreErrorFix(solutionPath, actionItem, logger);
+
+            panel.webview.postMessage({
+                command: 'updateFixStatus',
+                status: fixResult.success ? 'success' : 'error',
+                message: fixResult.message,
+                actionItem
+            });
+
+        } catch (error) {
+            logger.error('Failed to apply restore error fix', error);
+            panel.webview.postMessage({
+                command: 'updateFixStatus',
+                status: 'error',
+                message: `Fix failed: ${error instanceof Error ? error.message : String(error)}`,
+                actionItem
+            });
+        }
+    }
+
+    /**
+     * Handle analyzing restore errors for additional recommendations
+     */
+    async function handleAnalyzeRestoreErrors(panel: vscode.WebviewPanel, solutionPath: string, restoreErrors: string[], logger: Logger) {
+        try {
+            const simpleUpgrader = new SimplePackageUpgrader(logger);
+            
+            // Re-run restore and get fresh analysis
+            panel.webview.postMessage({
+                command: 'updateAnalysisStatus',
+                status: 'analyzing',
+                message: 'Re-analyzing restore errors...'
+            });
+
+            const { restoreErrors: newErrors, errorAnalysis } = await (simpleUpgrader as any).runRestoreAndAnalyzeErrors(solutionPath);
+
+            panel.webview.postMessage({
+                command: 'updateRestoreAnalysis',
+                restoreErrors: newErrors,
+                restoreErrorAnalysis: errorAnalysis
+            });
+
+        } catch (error) {
+            logger.error('Failed to analyze restore errors', error);
+            panel.webview.postMessage({
+                command: 'updateAnalysisStatus',
+                status: 'error',
+                message: `Analysis failed: ${error instanceof Error ? error.message : String(error)}`
+            });
+        }
+    }
+
+    /**
+     * Apply a specific restore error fix based on AI recommendation
+     */
+    async function applyRestoreErrorFix(solutionPath: string, actionItem: string, logger: Logger): Promise<{success: boolean, message: string}> {
+        return new Promise((resolve) => {
+            // Parse action item to determine fix type
+            if (actionItem.includes('Add explicit package references') || actionItem.includes('Install/reference')) {
+                // Extract package name and version from action item
+                const packageMatch = actionItem.match(/AWSSDK\.Core\s+([\d\.]+)/);
+                if (packageMatch) {
+                    const version = packageMatch[1];
+                    
+                    // Find projects that need the explicit reference
+                    const cmd = `dotnet add "${solutionPath}" package AWSSDK.Core --version ${version}`;
+                    
+                    exec(cmd, { timeout: 60000 }, (error: any, stdout: any, stderr: any) => {
+                        if (error) {
+                            resolve({
+                                success: false,
+                                message: `Failed to add package reference: ${error.message}`
+                            });
+                        } else {
+                            resolve({
+                                success: true,
+                                message: `Successfully added AWSSDK.Core ${version} package reference`
+                            });
+                        }
+                    });
+                    return;
+                }
+            }
+
+            // Generic package consolidation
+            if (actionItem.includes('package consolidation') || actionItem.includes('align dependency versions')) {
+                const cmd = `dotnet restore "${solutionPath}" --force`;
+                
+                exec(cmd, { timeout: 120000 }, (error: any, stdout: any, stderr: any) => {
+                    if (error) {
+                        resolve({
+                            success: false,
+                            message: `Package consolidation failed: ${error.message}`
+                        });
+                    } else {
+                        resolve({
+                            success: true,
+                            message: 'Package dependencies consolidated successfully'
+                        });
+                    }
+                });
+                return;
+            }
+
+            // Default response for unrecognized action items
+            resolve({
+                success: false,
+                message: 'Action item not recognized - manual intervention required'
+            });
+        });
+    }
         
     /**
      * Handle upgrade based on vulnerabilities (placeholder)
@@ -3560,6 +3699,249 @@ Respond ONLY with a valid JSON object in this exact format:
                 .scroll-to-bottom:hover {
                     background: var(--vscode-button-hoverBackground);
                 }
+                
+                /* Restore Error Analysis Styles */
+                .error-analysis-card {
+                    background: var(--vscode-input-background);
+                    border: 1px solid var(--vscode-input-border);
+                    border-radius: 8px;
+                    padding: 20px;
+                    margin: 15px 0;
+                }
+                
+                .severity-badge {
+                    display: inline-block;
+                    padding: 4px 12px;
+                    border-radius: 12px;
+                    font-size: 12px;
+                    font-weight: bold;
+                    text-transform: uppercase;
+                    margin-bottom: 10px;
+                }
+                
+                .severity-low { background: #4CAF50; color: white; }
+                .severity-medium { background: #ff9800; color: white; }
+                .severity-high { background: #f44336; color: white; }
+                .severity-critical { background: #9c27b0; color: white; }
+                
+                .error-categories {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                    gap: 15px;
+                    margin: 20px 0;
+                }
+                
+                .error-category {
+                    background: var(--vscode-editor-background);
+                    border: 1px solid var(--vscode-widget-border);
+                    border-radius: 6px;
+                    padding: 15px;
+                }
+                
+                .category-title {
+                    font-weight: bold;
+                    margin-bottom: 10px;
+                    color: var(--vscode-foreground);
+                }
+                
+                .error-count {
+                    font-size: 18px;
+                    font-weight: bold;
+                    color: #f44336;
+                }
+                
+                .recommendations-section {
+                    margin-top: 20px;
+                }
+                
+                .recommendation-item {
+                    background: var(--vscode-editor-background);
+                    border-left: 4px solid #2196F3;
+                    padding: 12px;
+                    margin: 8px 0;
+                    border-radius: 0 6px 6px 0;
+                }
+                
+                .action-items {
+                    margin-top: 15px;
+                }
+                
+                .action-item {
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    background: var(--vscode-editor-background);
+                    border: 1px solid var(--vscode-widget-border);
+                    border-radius: 6px;
+                    padding: 12px;
+                    margin: 8px 0;
+                }
+                
+                .action-text {
+                    flex: 1;
+                    margin-right: 15px;
+                }
+                
+                .fix-button {
+                    background: var(--vscode-button-background);
+                    color: var(--vscode-button-foreground);
+                    border: none;
+                    border-radius: 4px;
+                    padding: 8px 16px;
+                    cursor: pointer;
+                    font-size: 12px;
+                }
+                
+                .fix-button:hover {
+                    background: var(--vscode-button-hoverBackground);
+                }
+                
+                .fix-button:disabled {
+                    opacity: 0.6;
+                    cursor: not-allowed;
+                }
+                
+                .fix-status {
+                    font-size: 12px;
+                    padding: 4px 8px;
+                    border-radius: 4px;
+                    margin-left: 8px;
+                }
+                
+                .fix-status.applying { background: #2196F3; color: white; }
+                .fix-status.success { background: #4CAF50; color: white; }
+                .fix-status.error { background: #f44336; color: white; }
+                
+                /* Detailed Summary Styles */
+                .detailed-summary {
+                    margin-top: 25px;
+                    border-top: 2px solid var(--vscode-widget-border);
+                    padding-top: 20px;
+                }
+                
+                .project-summary-card {
+                    background: var(--vscode-editor-background);
+                    border: 1px solid var(--vscode-widget-border);
+                    border-radius: 8px;
+                    margin: 15px 0;
+                    overflow: hidden;
+                }
+                
+                .project-header {
+                    background: var(--vscode-input-background);
+                    padding: 15px;
+                    border-bottom: 1px solid var(--vscode-widget-border);
+                }
+                
+                .project-name {
+                    font-weight: bold;
+                    font-size: 16px;
+                    color: var(--vscode-foreground);
+                    margin-bottom: 5px;
+                }
+                
+                .project-path {
+                    font-size: 12px;
+                    color: var(--vscode-descriptionForeground);
+                    font-family: monospace;
+                }
+                
+                .project-content {
+                    padding: 20px;
+                }
+                
+                .error-types-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    gap: 10px;
+                    margin: 15px 0;
+                }
+                
+                .error-type-badge {
+                    display: inline-flex;
+                    align-items: center;
+                    padding: 6px 12px;
+                    border-radius: 16px;
+                    font-size: 12px;
+                    font-weight: bold;
+                    margin: 2px;
+                }
+                
+                .error-type-version-conflict {
+                    background: #fff3cd;
+                    color: #856404;
+                    border: 1px solid #ffeaa7;
+                }
+                
+                .error-type-dependency-constraint {
+                    background: #f8d7da;
+                    color: #721c24;
+                    border: 1px solid #f5c6cb;
+                }
+                
+                .error-type-missing-package {
+                    background: #d4edda;
+                    color: #155724;
+                    border: 1px solid #c3e6cb;
+                }
+                
+                .error-type-other {
+                    background: #e2e3e5;
+                    color: #383d41;
+                    border: 1px solid #d6d8db;
+                }
+                
+                .main-causes {
+                    margin: 15px 0;
+                }
+                
+                .cause-item {
+                    background: var(--vscode-input-background);
+                    border-left: 3px solid #ff9800;
+                    padding: 10px;
+                    margin: 5px 0;
+                    border-radius: 0 4px 4px 0;
+                }
+                
+                .version-conflict-details {
+                    background: var(--vscode-input-background);
+                    border: 1px solid var(--vscode-input-border);
+                    border-radius: 6px;
+                    padding: 15px;
+                    margin: 15px 0;
+                }
+                
+                .conflict-package {
+                    font-weight: bold;
+                    color: #f44336;
+                    margin-bottom: 5px;
+                }
+                
+                .conflict-description {
+                    font-style: italic;
+                    color: var(--vscode-descriptionForeground);
+                }
+                
+                .overall-recommendations {
+                    background: var(--vscode-input-background);
+                    border: 1px solid var(--vscode-input-border);
+                    border-radius: 8px;
+                    padding: 20px;
+                    margin: 20px 0;
+                }
+                
+                .recommendation-list {
+                    list-style: none;
+                    padding: 0;
+                }
+                
+                .recommendation-list li {
+                    background: var(--vscode-editor-background);
+                    border-left: 4px solid #4CAF50;
+                    padding: 10px;
+                    margin: 8px 0;
+                    border-radius: 0 4px 4px 0;
+                }
         </style>
     </head>
     <body>
@@ -3575,10 +3957,16 @@ Respond ONLY with a valid JSON object in this exact format:
                     </div>
                 </div>
                 
-            <div class="results-section" id="resultsSection">
+                            <div class="results-section" id="resultsSection">
                 <h3>📊 Upgrade Results</h3>
                 <div class="stats" id="statsContainer"></div>
                 <div id="detailedResults"></div>
+                
+                <!-- Restore Error Analysis Section -->
+                <div id="restoreErrorSection" style="display: none;">
+                    <h3>🔧 Restore Error Analysis</h3>
+                    <div id="restoreErrorAnalysis"></div>
+                </div>
                 </div>
                 
             <button class="scroll-to-bottom" id="scrollToBottom" onclick="scrollLogsToBottom()">
@@ -3607,8 +3995,14 @@ Respond ONLY with a valid JSON object in this exact format:
                             setStatus(message.status, message.message);
                             break;
                         case 'showResults':
-                            showResults(message.results, message.restoreErrors, message.aiStrategy);
+                            showResults(message.results, message.restoreErrors, message.restoreErrorAnalysis, message.strategy);
                         break;
+                        case 'updateFixStatus':
+                            updateFixStatus(message.actionItem, message.status, message.message);
+                            break;
+                        case 'updateRestoreAnalysis':
+                            updateRestoreAnalysis(message.restoreErrors, message.restoreErrorAnalysis);
+                            break;
                     }
                 });
 
@@ -3634,7 +4028,7 @@ Respond ONLY with a valid JSON object in this exact format:
                     statusText.textContent = message;
                 }
 
-                function showResults(results, restoreErrors, aiStrategy) {
+                function showResults(results, restoreErrors, restoreErrorAnalysis, strategy) {
                     const successCount = results.filter(r => r.success).length;
                     const failureCount = results.filter(r => !r.success).length;
                     const successRate = results.length > 0 ? Math.round((successCount / results.length) * 100) : 0;
@@ -3658,7 +4052,172 @@ Respond ONLY with a valid JSON object in this exact format:
                         </div>
                     \`;
                     
+                    // Show restore error analysis if available
+                    if (restoreErrorAnalysis && restoreErrors.length > 0) {
+                        showRestoreErrorAnalysis(restoreErrorAnalysis);
+                    }
+                    
                     resultsSection.style.display = 'block';
+                }
+                
+                function showRestoreErrorAnalysis(analysis) {
+                    const errorSection = document.getElementById('restoreErrorSection');
+                    const analysisContainer = document.getElementById('restoreErrorAnalysis');
+                    
+                    analysisContainer.innerHTML = \`
+                        <div class="error-analysis-card">
+                            <div class="severity-badge severity-\${analysis.severity}">\${analysis.severity} Severity</div>
+                            <p><strong>Analysis Summary:</strong> \${analysis.totalErrors} errors, \${analysis.totalWarnings} warnings detected</p>
+                            
+                            <div class="error-categories">
+                                <div class="error-category">
+                                    <div class="category-title">🔀 Version Conflicts</div>
+                                    <div class="error-count">\${analysis.categorizedErrors.versionConflicts.length}</div>
+                                </div>
+                                <div class="error-category">
+                                    <div class="category-title">📦 Dependency Constraints</div>
+                                    <div class="error-count">\${analysis.categorizedErrors.dependencyConstraints.length}</div>
+                                </div>
+                                <div class="error-category">
+                                    <div class="category-title">❌ Missing Packages</div>
+                                    <div class="error-count">\${analysis.categorizedErrors.missingPackages.length}</div>
+                                </div>
+                                <div class="error-category">
+                                    <div class="category-title">⚠️ Other Issues</div>
+                                    <div class="error-count">\${analysis.categorizedErrors.other.length}</div>
+                                </div>
+                            </div>
+                            
+                            \${analysis.aiRecommendations.length > 0 ? \`
+                            <div class="recommendations-section">
+                                <h4>🤖 AI Recommendations:</h4>
+                                \${analysis.aiRecommendations.map(rec => \`
+                                    <div class="recommendation-item">\${rec}</div>
+                                \`).join('')}
+                            </div>
+                            \` : ''}
+                            
+                            \${analysis.actionItems.length > 0 ? \`
+                            <div class="action-items">
+                                <h4>🔧 Action Items:</h4>
+                                \${analysis.actionItems.map((item, index) => \`
+                                    <div class="action-item" id="action-\${index}">
+                                        <div class="action-text">\${item}</div>
+                                        <button class="fix-button" onclick="applyFix('\${item}', \${index})">Apply Fix</button>
+                                        <div class="fix-status" id="status-\${index}" style="display: none;"></div>
+                                    </div>
+                                \`).join('')}
+                            </div>
+                            \` : ''}
+                            
+                            \${analysis.detailedSummary ? \`
+                            <div class="detailed-summary">
+                                <h4>📋 Detailed Project Analysis</h4>
+                                \${analysis.detailedSummary.projectSummaries.map(project => \`
+                                    <div class="project-summary-card">
+                                        <div class="project-header">
+                                            <div class="project-name">📁 \${project.projectName}</div>
+                                            <div class="project-path">\${project.projectPath}</div>
+                                        </div>
+                                        <div class="project-content">
+                                            \${project.errorTypes.length > 0 ? \`
+                                            <div class="error-types-section">
+                                                <h5>Error Types:</h5>
+                                                <div class="error-types-grid">
+                                                    \${project.errorTypes.map(errorType => \`
+                                                        <div class="error-type-badge error-type-\${errorType.type}">
+                                                            \${errorType.description}
+                                                            \${errorType.affectedPackages.length > 0 ? 
+                                                                \` (\${errorType.affectedPackages.join(', ')})\` : ''}
+                                                        </div>
+                                                    \`).join('')}
+                                                </div>
+                                            </div>
+                                            \` : ''}
+                                            
+                                            \${project.mainCauses.length > 0 ? \`
+                                            <div class="main-causes">
+                                                <h5>Main Causes:</h5>
+                                                \${project.mainCauses.map(cause => \`
+                                                    <div class="cause-item">🔍 \${cause}</div>
+                                                \`).join('')}
+                                            </div>
+                                            \` : ''}
+                                            
+                                            \${project.versionConflictDetails ? \`
+                                            <div class="version-conflict-details">
+                                                <h5>Version Conflict Details:</h5>
+                                                <div class="conflict-package">📦 \${project.versionConflictDetails.conflictedPackage}</div>
+                                                <div class="conflict-description">
+                                                    Required versions: \${project.versionConflictDetails.requiredVersions.join(', ')} - 
+                                                    \${project.versionConflictDetails.description}
+                                                </div>
+                                            </div>
+                                            \` : ''}
+                                        </div>
+                                    </div>
+                                \`).join('')}
+                                
+                                \${analysis.detailedSummary.overallRecommendations.length > 0 ? \`
+                                <div class="overall-recommendations">
+                                    <h4>💡 Overall Recommendations</h4>
+                                    <ul class="recommendation-list">
+                                        \${analysis.detailedSummary.overallRecommendations.map(rec => \`
+                                            <li>🚀 \${rec}</li>
+                                        \`).join('')}
+                                    </ul>
+                                </div>
+                                \` : ''}
+                            </div>
+                            \` : ''}
+                        </div>
+                    \`;
+                    
+                    errorSection.style.display = 'block';
+                }
+                
+                function applyFix(actionItem, index) {
+                    const button = document.querySelector(\`#action-\${index} .fix-button\`);
+                    const status = document.getElementById(\`status-\${index}\`);
+                    
+                    button.disabled = true;
+                    status.style.display = 'inline-block';
+                    status.className = 'fix-status applying';
+                    status.textContent = 'Applying...';
+                    
+                    vscode.postMessage({
+                        command: 'applyRestoreErrorFix',
+                        actionItem: actionItem
+                    });
+                }
+                
+                function updateFixStatus(actionItem, status, message) {
+                    // Find the action item and update its status
+                    const actionItems = document.querySelectorAll('.action-item');
+                    actionItems.forEach((item, index) => {
+                        const actionText = item.querySelector('.action-text').textContent;
+                        if (actionText === actionItem) {
+                            const statusElement = document.getElementById(\`status-\${index}\`);
+                            const button = item.querySelector('.fix-button');
+                            
+                            statusElement.className = \`fix-status \${status}\`;
+                            statusElement.textContent = message;
+                            
+                            if (status === 'success') {
+                                button.textContent = 'Applied ✓';
+                                button.style.background = '#4CAF50';
+                            } else if (status === 'error') {
+                                button.disabled = false;
+                                button.textContent = 'Retry';
+                            }
+                        }
+                    });
+                }
+                
+                function updateRestoreAnalysis(restoreErrors, restoreErrorAnalysis) {
+                    if (restoreErrorAnalysis) {
+                        showRestoreErrorAnalysis(restoreErrorAnalysis);
+                    }
                 }
 
                 function scrollLogsToBottom() {
