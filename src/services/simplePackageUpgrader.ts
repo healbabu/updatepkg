@@ -26,6 +26,47 @@ export interface UpgradeResult {
     aiRecommendation?: string;
 }
 
+export interface RestoreError {
+    type: 'warning' | 'error';
+    code: string;
+    message: string;
+    projectPath?: string;
+    fullText: string;
+}
+
+export interface RestoreErrorAnalysis {
+    totalErrors: number;
+    totalWarnings: number;
+    categorizedErrors: {
+        versionConflicts: RestoreError[];
+        dependencyConstraints: RestoreError[];
+        missingPackages: RestoreError[];
+        other: RestoreError[];
+    };
+    aiRecommendations: string[];
+    actionItems: string[];
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    canProceed: boolean;
+    detailedSummary?: {
+        projectSummaries: Array<{
+            projectName: string;
+            projectPath: string;
+            errorTypes: Array<{
+                type: 'version-conflict' | 'dependency-constraint' | 'missing-package' | 'other';
+                description: string;
+                affectedPackages: string[];
+            }>;
+            mainCauses: string[];
+            versionConflictDetails?: {
+                conflictedPackage: string;
+                requiredVersions: string[];
+                description: string;
+            };
+        }>;
+        overallRecommendations: string[];
+    };
+}
+
 /**
  * Simplified Package Upgrader - Focus on outdated packages only
  */
@@ -53,17 +94,48 @@ export class SimplePackageUpgrader {
     }
 
     /**
+     * Diagnose Copilot capabilities and log availability
+     */
+    private async diagnoseCopilotCapabilities(): Promise<void> {
+        try {
+            const diagnosis = await this.copilotService.diagnoseCopilotAvailability();
+            
+            if (diagnosis.languageModelAvailable && diagnosis.availableModels.length > 0) {
+                this.emitProgress(`✅ AI features enabled: ${diagnosis.availableModels.length} model(s) available`, 'success');
+                this.logger.info('🚀 AI-powered analysis will be used for upgrade strategies and error analysis');
+            } else {
+                this.emitProgress('⚠️ AI features limited: Using fallback strategies', 'warning');
+                
+                if (diagnosis.recommendations.length > 0) {
+                    this.emitProgress('💡 To enable AI features:', 'info');
+                    diagnosis.recommendations.forEach(rec => {
+                        this.emitProgress(`   - ${rec}`, 'info');
+                    });
+                }
+            }
+        } catch (error) {
+            this.emitProgress('⚠️ Unable to diagnose AI capabilities, continuing with fallback methods', 'warning');
+            this.logger.warn('Failed to diagnose Copilot capabilities', error);
+        }
+    }
+
+    /**
      * 🎯 Enhanced upgrade flow with progress reporting
      */
     async upgradePackages(solutionPath: string): Promise<{
         results: UpgradeResult[];
         restoreErrors: string[];
+        restoreErrorAnalysis?: RestoreErrorAnalysis;
         aiStrategy: SimpleUpgradeStrategy;
     }> {
         try {
             // Store solution directory for later use
             this.solutionDirectory = path.dirname(solutionPath);
             this.emitProgress(`📂 Working in: ${this.solutionDirectory}`);
+
+            // Step -1: Diagnose Copilot availability for AI features
+            this.emitProgress('🤖 Diagnosing AI capabilities...');
+            await this.diagnoseCopilotCapabilities();
 
             // Step 0: Ensure solution is restored first
             this.emitProgress('🔄 Ensuring solution is restored...');
@@ -150,14 +222,22 @@ export class SimplePackageUpgrader {
                 }
             }
 
-            // Step 5: Run restore
+            // Step 5: Run restore and analyze errors
             this.emitProgress('🔄 Running dotnet restore...');
-            const restoreErrors = await this.runRestoreAndCaptureErrors(solutionPath);
+            const { restoreErrors, errorAnalysis } = await this.runRestoreAndAnalyzeErrors(solutionPath);
             
             if (restoreErrors.length === 0) {
                 this.emitProgress('✅ dotnet restore completed successfully', 'success');
             } else {
                 this.emitProgress(`⚠️ dotnet restore completed with ${restoreErrors.length} errors`, 'warning');
+                
+                // Display AI analysis if available
+                if (errorAnalysis) {
+                    this.emitProgress(`🔍 Error Analysis: ${errorAnalysis.severity} severity`, 'warning');
+                    if (errorAnalysis.aiRecommendations.length > 0) {
+                        this.emitProgress(`💡 AI Recommendations: ${errorAnalysis.aiRecommendations.length} suggestions available`, 'info');
+                    }
+                }
             }
 
             const successCount = results.filter(r => r.success).length;
@@ -166,7 +246,7 @@ export class SimplePackageUpgrader {
             this.emitProgress(`🎉 Upgrade completed! ${successCount} successful, ${failureCount} failed`, 
                 failureCount === 0 ? 'success' : 'warning');
 
-            return { results, restoreErrors, aiStrategy };
+            return { results, restoreErrors, restoreErrorAnalysis: errorAnalysis, aiStrategy };
 
         } catch (error) {
             this.emitProgress(`💥 Package upgrade failed: ${error instanceof Error ? error.message : String(error)}`, 'error');
@@ -575,17 +655,24 @@ Respond with ONLY a JSON object:
     }
 
     /**
-     * Run dotnet restore and capture any errors
+     * Run dotnet restore and analyze errors
      */
-    private async runRestoreAndCaptureErrors(solutionPath: string): Promise<string[]> {
-        return new Promise((resolve) => {
+    private async runRestoreAndAnalyzeErrors(solutionPath: string): Promise<{ restoreErrors: string[], errorAnalysis?: RestoreErrorAnalysis }> {
+        return new Promise(async (resolve) => {
             const cmd = `dotnet restore "${solutionPath}"`;
             
-            exec(cmd, { timeout: 120000 }, (error, stdout, stderr) => {
-                const errors: string[] = [];
+            exec(cmd, { timeout: 120000 }, async (error, stdout, stderr) => {
+                const rawErrors: string[] = [];
+                let fullOutput = '';
                 
+                // Capture all output for analysis
+                if (stdout) fullOutput += stdout;
+                if (stderr) fullOutput += stderr;
+                if (error) fullOutput += error.message;
+                
+                // Extract error lines
                 if (error) {
-                    errors.push(`Restore failed: ${error.message}`);
+                    rawErrors.push(`Restore failed: ${error.message}`);
                 }
                 
                 if (stderr) {
@@ -594,16 +681,193 @@ Respond with ONLY a JSON object:
                         if (line.includes('NU1107') || 
                             line.includes('NU1102') || 
                             line.includes('NU1605') || 
+                            line.includes('NU1608') ||
                             line.includes('error') ||
                             line.includes('ERROR')) {
-                            errors.push(line.trim());
+                            rawErrors.push(line.trim());
                         }
                     }
                 }
 
-                this.logger.info(`Restore completed with ${errors.length} errors`);
-                resolve(errors);
+                this.logger.info(`Restore completed with ${rawErrors.length} errors`);
+                
+                // Analyze errors if any exist
+                let errorAnalysis: RestoreErrorAnalysis | undefined = undefined;
+                if (rawErrors.length > 0) {
+                    try {
+                        errorAnalysis = await this.analyzeRestoreErrors(rawErrors, fullOutput);
+                    } catch (analysisError) {
+                        this.logger.warn('Failed to analyze restore errors', analysisError);
+                    }
+                }
+                
+                resolve({ restoreErrors: rawErrors, errorAnalysis });
             });
         });
     }
+
+    /**
+     * Parse and analyze restore errors with AI assistance
+     */
+    private async analyzeRestoreErrors(rawErrors: string[], fullOutput: string): Promise<RestoreErrorAnalysis> {
+        // Parse individual errors
+        const parsedErrors = this.parseRestoreErrors(rawErrors);
+        
+        // Categorize errors
+        const categorizedErrors = this.categorizeRestoreErrors(parsedErrors);
+        
+        // Get AI analysis and recommendations
+        const { aiRecommendations, actionItems, severity, canProceed } = await this.getAIRestoreErrorAnalysis(parsedErrors, fullOutput);
+        
+        // Generate detailed structured summary
+        let detailedSummary;
+        try {
+            const detailedAnalysis = await this.copilotService.generateDetailedRestoreErrorSummary(parsedErrors, fullOutput);
+            detailedSummary = {
+                projectSummaries: detailedAnalysis.projectSummaries,
+                overallRecommendations: detailedAnalysis.overallRecommendations
+            };
+        } catch (error) {
+            this.logger.warn('Failed to generate detailed restore error summary', error);
+            // detailedSummary will remain undefined
+        }
+        
+        return {
+            totalErrors: parsedErrors.filter(e => e.type === 'error').length,
+            totalWarnings: parsedErrors.filter(e => e.type === 'warning').length,
+            categorizedErrors,
+            aiRecommendations,
+            actionItems,
+            severity,
+            canProceed,
+            detailedSummary
+        };
+    }
+
+    /**
+     * Parse raw error strings into structured RestoreError objects
+     */
+    private parseRestoreErrors(rawErrors: string[]): RestoreError[] {
+        const parsedErrors: RestoreError[] = [];
+        
+        for (const errorText of rawErrors) {
+            if (!errorText.trim()) continue;
+            
+            // Extract error code (e.g., NU1107, NU1608)
+            const codeMatch = errorText.match(/\b(NU\d{4})\b/);
+            const code = codeMatch ? codeMatch[1] : 'UNKNOWN';
+            
+            // Determine type
+            const type: 'warning' | 'error' = errorText.toLowerCase().includes('error') ? 'error' : 'warning';
+            
+            // Extract project path
+            const projectMatch = errorText.match(/([^:]+\.csproj)\s*:/);
+            const projectPath = projectMatch ? projectMatch[1] : undefined;
+            
+            // Extract main message
+            let message = errorText;
+            if (projectMatch) {
+                message = errorText.substring(errorText.indexOf(':', projectMatch.index! + projectMatch[1].length) + 1).trim();
+            }
+            
+            parsedErrors.push({
+                type,
+                code,
+                message: message.trim(),
+                projectPath,
+                fullText: errorText
+            });
+        }
+        
+        return parsedErrors;
+    }
+
+    /**
+     * Categorize parsed errors by type
+     */
+    private categorizeRestoreErrors(errors: RestoreError[]): RestoreErrorAnalysis['categorizedErrors'] {
+        const categorized = {
+            versionConflicts: [] as RestoreError[],
+            dependencyConstraints: [] as RestoreError[],
+            missingPackages: [] as RestoreError[],
+            other: [] as RestoreError[]
+        };
+        
+        for (const error of errors) {
+            switch (error.code) {
+                case 'NU1107': // Version conflict
+                    categorized.versionConflicts.push(error);
+                    break;
+                case 'NU1608': // Package version outside dependency constraint
+                    categorized.dependencyConstraints.push(error);
+                    break;
+                case 'NU1102': // Package not found
+                case 'NU1101': // Package not found
+                    categorized.missingPackages.push(error);
+                    break;
+                default:
+                    categorized.other.push(error);
+                    break;
+            }
+        }
+        
+        return categorized;
+    }
+
+    /**
+     * Get AI analysis and recommendations for restore errors
+     */
+    private async getAIRestoreErrorAnalysis(errors: RestoreError[], fullOutput: string): Promise<{
+        aiRecommendations: string[];
+        actionItems: string[];
+        severity: 'low' | 'medium' | 'high' | 'critical';
+        canProceed: boolean;
+    }> {
+        try {
+            const analysis = await this.copilotService.analyzeRestoreErrors(errors, fullOutput);
+            return analysis;
+        } catch (error) {
+            this.logger.warn('AI restore error analysis failed, using fallback', error);
+            return this.getFallbackRestoreErrorAnalysis(errors);
+        }
+    }
+
+    /**
+     * Fallback analysis when AI is unavailable
+     */
+    private getFallbackRestoreErrorAnalysis(errors: RestoreError[]): {
+        aiRecommendations: string[];
+        actionItems: string[];
+        severity: 'low' | 'medium' | 'high' | 'critical';
+        canProceed: boolean;
+    } {
+        const errorCount = errors.filter(e => e.type === 'error').length;
+        const versionConflicts = errors.filter(e => e.code === 'NU1107').length;
+        
+        let severity: 'low' | 'medium' | 'high' | 'critical' = 'low';
+        let canProceed = true;
+        const actionItems: string[] = [];
+        const aiRecommendations: string[] = [];
+        
+        if (errorCount > 0) {
+            severity = errorCount > 3 ? 'critical' : 'high';
+            canProceed = false;
+        } else if (versionConflicts > 0) {
+            severity = versionConflicts > 5 ? 'high' : 'medium';
+        }
+        
+        // Generate basic recommendations
+        if (versionConflicts > 0) {
+            actionItems.push('Review package version conflicts and align dependency versions');
+            aiRecommendations.push('Consider using package consolidation to align versions across projects');
+        }
+        
+        if (errors.some(e => e.code === 'NU1107')) {
+            actionItems.push('Add explicit package references to resolve version conflicts');
+            aiRecommendations.push('Use `dotnet add package` with specific versions to resolve conflicts');
+        }
+        
+        return { aiRecommendations, actionItems, severity, canProceed };
+    }
+
 } 
